@@ -1,0 +1,67 @@
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: login-test
+  namespace: auth0
+  name: login-test
+spec:
+  type: ClusterIP
+  selector:
+    app: login-test
+  ports:
+    - port: 3005
+      targetPort: 3000
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: login-test
+  labels:
+    app: login-test
+  namespace: auth0
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: login-test
+  template:
+    metadata:
+      labels:
+        app: login-test
+    spec:
+      containers:
+        - image: node:22.6-slim
+          name: login-test
+          securityContext:
+            runAsUser: 1000
+            runAsNonRoot: true
+          tty: true
+          command:
+            - sh
+            - -c
+            - |
+              cd /home/node/ \
+              && npm init -y \
+              && npm install express \
+              && echo "complete npm install" \
+              && mkdir -p /home/node/public \
+              && ls /config \
+              && cp /config/server.js /home/node/ \
+              && cp /config/*.html /home/node/public/ \
+              && node /home/node/server.js
+          ports:
+            - containerPort: 3000
+              name: login-test
+          volumeMounts:
+            - name: nodejs-data
+              mountPath: /home/node
+            - name: nodejs-app-login
+              mountPath: /config/
+      volumes:
+        - name: nodejs-data
+          emptyDir: {}
+        - name: nodejs-app-login
+          configMap:
+            name: nodejs-app-login
