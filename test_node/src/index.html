@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login Test Application</title>
+</head>
+<body>
+    <h1>Login Test Application</h1>
+
+    <button id="loginBtn">Login with Google</button>
+    
+    <div id="userInfo" style="display: none;">
+        <h2>Logged in User Information:</h2>
+        <p id="userEmail"></p>
+        <img id="userPicture" alt="User Picture">
+    </div>
+
+    <script>
+        document.getElementById('loginBtn').onclick = function () {
+            // Google認証を行うマイクロサービスのエンドポイントにリダイレクト
+            window.location.href = "http://localhost:8080/auth/google";
+        };
+
+        // クエリパラメータからユーザー情報を表示
+        window.onload = function () {
+            const urlParams = new URLSearchParams(window.location.search);
+            const email = urlParams.get('email');
+            const picture = urlParams.get('picture');
+
+            if (email && picture) {
+                document.getElementById('userEmail').textContent = `Email: ${email}`;
+                document.getElementById('userPicture').src = picture;
+                document.getElementById('userInfo').style.display = 'block';
+            }
+        };
+    </script>
+</body>
+</html>
+
