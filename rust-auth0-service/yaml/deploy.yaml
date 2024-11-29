@@ -1,0 +1,26 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rust-auth0-service
+  namespace: auth0
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: rust-auth0-service
+  template:
+    metadata:
+      labels:
+        app: rust-auth0-service
+    spec:
+      containers:
+      - name: rust-auth0-service
+        image: tororomeshi/rust-auth0-service:0.3.5
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+        envFrom:
+          - secretRef:
+              name: google-auth-secrets
+          - configMapRef:
+              name: google-auth-config

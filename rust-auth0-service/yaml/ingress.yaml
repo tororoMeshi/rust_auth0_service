@@ -1,0 +1,20 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rust-auth0-ingress
+  namespace: auth0
+  annotations:
+    ingressClassName: "cloudflare"  # 使用しているIngressコントローラに応じて変更
+spec:
+  rules:
+  - host: auth.tororomeshi.net
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: rust-auth0-service
+            port:
+              number: 8080
+

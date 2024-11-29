@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: login-test
+  namespace: auth0
+  name: login-test
+spec:
+  # type: NodePort
+  selector:
+    app: login-test
+  ports:
+    - targetPort: 3000
+      port: 3005
+      protocol: TCP
+      # nodePort: 32005
