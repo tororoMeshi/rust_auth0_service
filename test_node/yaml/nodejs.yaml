@@ -1,18 +1,4 @@
-apiVersion: v1
-kind: Service
-metadata:
-  labels:
-    app: login-test
-  namespace: auth0
-  name: login-test
-spec:
-  type: ClusterIP
-  selector:
-    app: login-test
-  ports:
-    - port: 3005
-      targetPort: 3000
-      protocol: TCP
+
 ---
 apiVersion: apps/v1
 kind: Deployment

@@ -29,8 +29,7 @@ COPY --from=builder /usr/src/app/target/release/rust-auth0-service /usr/local/bi
 EXPOSE 8080
 
 # 環境変数を設定
-# COPY .env /usr/src/app/.env
+COPY .env /usr/src/app/.env
 
 # コンテナ起動時に実行するコマンド
-# CMD ["rust-auth0-service"]
-CMD ["/usr/local/bin/rust-auth0-service"]
+CMD ["rust-auth0-service"]
