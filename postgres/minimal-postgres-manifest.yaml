@@ -1,0 +1,22 @@
+apiVersion: "acid.zalan.do/v1"
+kind: postgresql
+metadata:
+  name: auth0-account-db
+  namespace: auth0
+spec:
+  teamId: "auth0-team"
+  volume:
+    size: 1Gi
+    storageClass: longhorn
+  numberOfInstances: 2
+  users:
+    tororomeshi:  # 管理ユーザー
+    - superuser
+    - createdb
+    auth0_app_user:  # アプリケーション接続ユーザー
+    - login  # ログイン権限
+  databases:
+    auth0_accounts: tororomeshi  # 管理ユーザーがオーナー
+    auth0_app: auth0_app_user  # アプリケーション用データベースとそのオーナー
+  postgresql:
+    version: "17"
