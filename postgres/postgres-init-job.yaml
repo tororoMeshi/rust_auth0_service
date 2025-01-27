@@ -1,0 +1,47 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: postgres-init-job
+  namespace: auth0
+spec:
+  backoffLimit: 5  # 再試行回数を増加
+  template:
+    spec:
+      containers:
+      - name: init-sql
+        image: postgres:17  # PostgreSQLクライアントイメージ
+        command:
+        - sh
+        - -c
+        - |
+          export PGPASSWORD=$POSTGRES_PASSWORD
+          psql -v ON_ERROR_STOP=1 --host=$POSTGRES_HOST --username=$POSTGRES_USER --dbname=postgres --file=/mnt/scripts/init.sql
+        env:
+        - name: POSTGRES_HOST
+          value: auth0-account-db
+        - name: POSTGRES_USER
+          valueFrom:
+            secretKeyRef:
+              name: tororomeshi.auth0-account-db.credentials.postgresql.acid.zalan.do
+              key: username
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: tororomeshi.auth0-account-db.credentials.postgresql.acid.zalan.do
+              key: password
+        volumeMounts:
+        - name: init-sql-script
+          mountPath: /mnt/scripts
+          readOnly: true
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+      restartPolicy: OnFailure
+      volumes:
+      - name: init-sql-script
+        configMap:
+          name: postgres-init-sql

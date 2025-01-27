@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init-sql
+  namespace: auth0
+data:
+  init.sql: |
+    DO $$
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'auth0_accounts') THEN
+            CREATE DATABASE auth0_accounts;
+        END IF;
+    END $$;
+
+    \c auth0_accounts;
+
+    CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        email VARCHAR(255) UNIQUE NOT NULL,
+        google_id VARCHAR(255) UNIQUE NOT NULL,
+        name VARCHAR(255),
+        icon_url TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+    CREATE INDEX IF NOT EXISTS idx_users_google_id ON users(google_id);
+
+    INSERT INTO users (email, google_id, name)
+    SELECT 'admin@example.com', 'google-admin-id', 'Administrator'
+    WHERE NOT EXISTS (
+        SELECT 1 FROM users WHERE email = 'admin@example.com'
+    );
