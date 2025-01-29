@@ -31,3 +31,13 @@ data:
     WHERE NOT EXISTS (
         SELECT 1 FROM users WHERE email = 'admin@example.com'
     );
+
+    -- もしまだユーザーが対象DBに接続権限を持っていない場合
+    GRANT CONNECT ON DATABASE auth0_accounts TO auth0_app_user;
+    GRANT USAGE ON SCHEMA public TO auth0_app_user;
+
+    -- テーブルへの DML 権限 (SELECT, INSERT, UPDATE, DELETE) を付与
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.users TO auth0_app_user;
+
+    -- シーケンス (AUTO_INCREMENT) がある場合、USAGE 権限が必要
+    GRANT USAGE ON SEQUENCE public.users_id_seq TO auth0_app_user;

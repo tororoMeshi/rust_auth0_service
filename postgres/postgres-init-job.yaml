@@ -4,6 +4,9 @@ metadata:
   name: postgres-init-job
   namespace: auth0
 spec:
+  # ジョブ完了後にPodを自動削除 (60秒後)
+  ttlSecondsAfterFinished: 60
+
   backoffLimit: 5  # 再試行回数を増加
   template:
     spec:
