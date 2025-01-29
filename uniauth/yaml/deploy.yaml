@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: uniauth
+  namespace: auth0
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: uniauth
+  template:
+    metadata:
+      labels:
+        app: uniauth
+    spec:
+      containers:
+      - name: uniauth
+        image: tororomeshi/uniauth:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8081
+        env:
+          # PostgreSQL Operator で作成された Service 名
+          # kubectl get svc -n auth0 で確認した "auth0-account-db" を利用
+        - name: POSTGRES_HOST
+          value: auth0-account-db
+
+          # Zalando Operator が作成した Secret を参照
+        - name: POSTGRES_USER
+          valueFrom:
+            secretKeyRef:
+              name: auth0-app-user.auth0-account-db.credentials.postgresql.acid.zalan.do
+              key: username
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: auth0-app-user.auth0-account-db.credentials.postgresql.acid.zalan.do
+              key: password
+
+          # DB名は固定 or 別の ConfigMap/Secret で管理するなどお好みで
+        - name: DB_NAME
+          value: auth0_accounts
+
+          # JWT 署名用の秘密鍵も Kubernetes Secret で管理するのが安全
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: uniauth-secrets
+              key: jwt_secret

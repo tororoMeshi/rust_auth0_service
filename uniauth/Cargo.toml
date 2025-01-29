@@ -1,18 +1,21 @@
 [package]
-name = "rust-auth0-service"
-version = "0.3.3"
+name = "uniauth"
+version = "0.5.0"
 edition = "2021"
 
 [dependencies]
+actix-logger = "0.4"
+actix-rt = "2"
 actix-web = "4.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 jsonwebtoken = "9.3"
 futures = "0.3"
 oauth2 = "4.4"
-url = "2.3"
 dotenv = "0.15"
 reqwest = { version = "0.12", features = ["json"] }
 env_logger = "0.11"
 log = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+sqlx = { version = "0.6", features = ["postgres", "runtime-tokio-native-tls", "chrono"] }
 tokio = { version = "1", features = ["macros", "signal"] }

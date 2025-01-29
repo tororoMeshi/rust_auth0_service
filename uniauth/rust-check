@@ -1,0 +1,16 @@
+FROM rust:latest
+
+# 必要なコンポーネントやパッケージをインストール
+RUN rustup component add clippy
+RUN apt-get update && apt-get install -y pkg-config libssl-dev
+
+# cargo-outdatedをインストール
+RUN cargo install cargo-outdated
+
+WORKDIR /usr/src/myapp
+
+# ソースコードを全てコピー
+COPY . .
+
+# コマンドを実行
+CMD ["sh", "-c", "cargo outdated && cargo check && cargo clippy -- -D warnings"]

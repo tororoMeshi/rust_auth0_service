@@ -23,7 +23,7 @@ RUN apt-get update \
 WORKDIR /usr/src/app
 
 # ビルドしたバイナリをコピー
-COPY --from=builder /usr/src/app/target/release/rust-auth0-service /usr/local/bin/rust-auth0-service
+COPY --from=builder /usr/src/app/target/release/uniauth /usr/local/bin/uniauth
 
 # ポートの公開
 EXPOSE 8080
@@ -33,4 +33,4 @@ EXPOSE 8080
 
 # コンテナ起動時に実行するコマンド
 # CMD ["rust-auth0-service"]
-CMD ["/usr/local/bin/rust-auth0-service"]
+CMD ["/usr/local/bin/uniauth"]

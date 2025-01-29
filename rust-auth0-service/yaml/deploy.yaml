@@ -15,12 +15,23 @@ spec:
     spec:
       containers:
       - name: rust-auth0-service
-        image: tororomeshi/rust-auth0-service:0.3.5
+        image: tororomeshi/rust_auth0_service:latest
         imagePullPolicy: Always
         ports:
         - containerPort: 8080
-        envFrom:
-          - secretRef:
-              name: google-auth-secrets
-          - configMapRef:
-              name: google-auth-config
+        env:
+          - name: GOOGLE_CLIENT_ID
+            valueFrom:
+              secretKeyRef:
+                name: google-auth-secrets
+                key: client_id
+          - name: GOOGLE_CLIENT_SECRET
+            valueFrom:
+              secretKeyRef:
+                name: google-auth-secrets
+                key: client_secret
+          - name: GOOGLE_REDIRECT_URI
+            value: "https://auth.tororomeshi.net/auth/google/callback"
+          # ユニオスのURL等
+          - name: UNIAUTH_URL
+            value: "http://uniauth:8081"
