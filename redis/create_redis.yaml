@@ -1,0 +1,54 @@
+apiVersion: databases.spotahome.com/v1
+kind: RedisFailover
+metadata:
+  name: redisfailover
+  namespace: auth0
+spec:
+  sentinel:
+    replicas: 3
+    resources:
+      requests:
+        cpu: "100m"
+      limits:
+        memory: "100Mi"
+    # Sentinel の動作に関するカスタム設定（ミリ秒指定など）
+    customConfig:
+      - "down-after-milliseconds 2000"
+      - "failover-timeout 3000"
+  redis:
+    replicas: 3
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "100Mi"
+      limits:
+        cpu: "400m"
+        memory: "500Mi"
+    # Redis の動作に関するカスタム設定
+    customConfig:
+      - "maxclients 100"
+      - "hz 50"
+      - "timeout 60"
+      - "tcp-keepalive 60"
+      - "client-output-buffer-limit normal 0 0 0"
+      - "client-output-buffer-limit slave 1000000000 1000000000 0"
+      - "client-output-buffer-limit pubsub 33554432 8388608 60"
+    # コンテナ・セキュリティの設定（非 root での実行を推奨）
+    securityContext:
+      runAsUser: 1000
+      runAsGroup: 1000
+      fsGroup: 1000
+    containerSecurityContext:
+      readOnlyRootFilesystem: false
+    # 永続ストレージの設定：Longhorn StorageClass を利用して PVC を作成
+    storage:
+      persistentVolumeClaim:
+        metadata:
+          name: redisfailover-data
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 100Mi
+          storageClassName: longhorn

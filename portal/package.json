@@ -1,0 +1,14 @@
+{
+    "name": "portal-site",
+    "version": "1.0.0",
+    "scripts": {
+      "dev": "nuxt",
+      "build": "nuxt build",
+      "start": "nuxt start"
+    },
+    "dependencies": {
+      "nuxt": "^2.15.8",
+      "axios": "^0.27.2"
+    }
+  }
+  
