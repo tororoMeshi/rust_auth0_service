@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nuxt-portal
+  namespace: auth0
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nuxt-portal
+  template:
+    metadata:
+      labels:
+        app: nuxt-portal
+    spec:
+      containers:
+      - name: nuxt-portal
+        image: tororomeshi/nuxt-portal:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 3000
+        env:
+          # 必要に応じて環境変数を設定（例: API_BASE_URL など）
+          - name: API_BASE_URL
+            value: "https://auth.tororomeshi.net"

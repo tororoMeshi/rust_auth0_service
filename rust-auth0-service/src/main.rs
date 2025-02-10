@@ -1,8 +1,12 @@
-// RedisSessionStore は actix_session::storage モジュールからインポート（機能フラグ redis-rs-session 有効）
+// 必要なクレートのインポート
+#[allow(unused_imports)]
+use actix_cors::Cors;
+#[allow(unused_imports)]
+use actix_web::http::header;
+
 use actix_session::storage::RedisSessionStore;
 use actix_session::{Session, SessionMiddleware};
 use actix_web::cookie::{Cookie, Key, SameSite};
-// use actix_web::{get, web, App, HttpResponse, HttpServer, Responder};
 use actix_web::{get, web, App, HttpResponse, HttpServer};
 use dotenv::dotenv;
 use log::{error, info};
@@ -102,21 +106,28 @@ async fn google_auth_callback(session: Session, query: web::Query<CallbackQuery>
 
     match token_result {
         Ok(token) => {
-            // 6. oauth2::TokenResponse トレイトにより access_token() を利用
             let access_token = token.access_token().secret().clone();
             match get_google_user_info(&access_token).await {
                 Ok(user_info) => {
                     match request_session_from_uniauth(&user_info).await {
                         Ok(session_data) => {
-                            // 7. セッションに保存していたリダイレクト先を取得（なければ "/"）
-                            let redirect_url: String = session
+                            // 7. セッションに保存されたリダイレクト先を取得（デフォルトは "/"）
+                            let raw_redirect: String = session
                                 .get("redirect")
                                 .unwrap_or(Some("/".to_string()))
                                 .unwrap_or("/".to_string());
+                            // もしリダイレクト先が相対パスなら、ポータルサイトのドメインを付加
+                            let redirect_url = if raw_redirect.starts_with('/') {
+                                format!("https://app.tororomeshi.net{}", raw_redirect)
+                            } else if raw_redirect.starts_with("https://app.tororomeshi.net") {
+                                raw_redirect
+                            } else {
+                                "https://app.tororomeshi.net/".to_string()
+                            };
+
                             let cookie_domain = env::var("COOKIE_DOMAIN")
                                 .unwrap_or_else(|_| ".tororomeshi.net".to_string());
 
-                            // 8. セッション ID と JWT を Cookie に設定
                             let session_cookie =
                                 Cookie::build("session_id", session_data.session_id.clone())
                                     .path("/")
@@ -132,6 +143,8 @@ async fn google_auth_callback(session: Session, query: web::Query<CallbackQuery>
                                 .secure(true)
                                 .same_site(SameSite::Strict)
                                 .finish();
+
+                            info!("Redirecting user to: {}", redirect_url);
 
                             HttpResponse::Found()
                                 .cookie(session_cookie)
@@ -205,6 +218,10 @@ async fn main() -> std::io::Result<()> {
     dotenv().ok();
     env_logger::init();
 
+    // CORS の設定を追加
+    use actix_cors::Cors;
+    use actix_web::http::header;
+
     // RedisSessionStore を REDIS_URL から初期化
     let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://redis:6379".to_string());
     let redis_store = RedisSessionStore::new(redis_url)
@@ -217,6 +234,18 @@ async fn main() -> std::io::Result<()> {
 
     HttpServer::new(move || {
         App::new()
+            .wrap(
+                Cors::default()
+                    .allowed_origin("https://app.tororomeshi.net")
+                    .allowed_origin("https://auth.tororomeshi.net")
+                    .allowed_methods(vec!["GET", "POST", "OPTIONS"])
+                    .allowed_headers(vec![
+                        header::AUTHORIZATION,
+                        header::ACCEPT,
+                        header::CONTENT_TYPE,
+                    ])
+                    .supports_credentials(),
+            )
             .app_data(web::Data::new(redis_store.clone()))
             .wrap(SessionMiddleware::new(
                 redis_store.clone(),

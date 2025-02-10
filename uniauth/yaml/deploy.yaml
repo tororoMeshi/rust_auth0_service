@@ -47,3 +47,7 @@ spec:
             secretKeyRef:
               name: uniauth-secrets
               key: jwt_secret
+
+          # RedisにアクセスするためのURL
+        - name: REDIS_URL
+          value: "redis://rfrm-redisfailover:6379"

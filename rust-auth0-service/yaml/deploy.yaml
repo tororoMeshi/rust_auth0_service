@@ -32,6 +32,12 @@ spec:
                 key: client_secret
           - name: GOOGLE_REDIRECT_URI
             value: "https://auth.tororomeshi.net/auth/google/callback"
-          # ユニオスのURL等
           - name: UNIAUTH_URL
             value: "http://uniauth:8081"
+          - name: REDIS_URL
+            value: "redis://rfrm-redisfailover:6379"
+          - name: SESSION_SECRET_KEY
+            valueFrom:
+              secretKeyRef:
+                name: session-secret
+                key: SESSION_SECRET_KEY

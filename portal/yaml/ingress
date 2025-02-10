@@ -1,0 +1,19 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nuxt-portal-ingress
+  namespace: auth0
+  annotations:
+    ingressClassName: "cloudflare"  # 使用しているIngressコントローラに応じて変更
+spec:
+  rules:
+  - host: app.tororomeshi.net
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: nuxt-portal
+            port:
+              number: 3000

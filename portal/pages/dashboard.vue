@@ -2,8 +2,8 @@
     <div class="dashboard">
       <h1>Dashboard</h1>
       <div v-if="user">
-        <p>Email: {{ user.email }}</p>
-        <p>Name: {{ user.name }}</p>
+        <p><strong>Email:</strong> {{ user.email }}</p>
+        <p><strong>Name:</strong> {{ user.name }}</p>
         <button @click="logout">Logout</button>
       </div>
       <div v-else>
@@ -20,28 +20,34 @@
       }
     },
     async mounted() {
-      try {
-        // 認証状態確認 API を呼び出す（Cookie は HttpOnly だが、サーバ側で検証）
-        const res = await this.$axios.get('/api/me', { withCredentials: true });
-        if (res && res.data && res.data.user) {
-          this.user = res.data.user;
-        } else {
-          this.user = null;
-        }
-      } catch (e) {
-        console.error("Failed to fetch user info:", e);
-        this.user = null;
-      }
+      await this.fetchUser();
     },
     methods: {
+      async fetchUser() {
+        try {
+          // 認証状態確認用の API を呼び出す（Cookie を利用している前提）
+          const res = await this.$axios.get('/api/me', { withCredentials: true });
+          if (res && res.data && res.data.user) {
+            this.user = res.data.user;
+          } else {
+            // ユーザー情報が取得できない場合はエラーメッセージを作成
+            const errMsg = "No user info returned from API.";
+            console.error("Error fetching user info:", errMsg);
+            // エラー画面に遷移
+            this.$router.push({ path: '/login-error', query: { error: errMsg } });
+          }
+        } catch (e) {
+          console.error("Failed to fetch user info:", e);
+          // エラー画面に遷移し、エラー内容をクエリパラメータとして渡す
+          this.$router.push({ path: '/login-error', query: { error: e.message || "Unknown error" } });
+        }
+      },
       async logout() {
         try {
-          // uniauth の /logout エンドポイントにログアウトリクエストを送信
           await this.$axios.post('https://auth.tororomeshi.net/uniauth/logout', {}, { withCredentials: true });
         } catch (e) {
           console.error("Logout failed:", e);
         } finally {
-          // ログアウト後はトップページへリダイレクト
           window.location.href = '/';
         }
       }
@@ -53,7 +59,14 @@
   .dashboard {
     max-width: 600px;
     margin: 0 auto;
+    padding: 2em;
     text-align: center;
+  }
+  button {
+    margin-top: 1em;
+    padding: 0.8em 1.5em;
+    font-size: 1em;
+    cursor: pointer;
   }
   </style>
   

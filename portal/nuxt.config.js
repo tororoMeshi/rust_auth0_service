@@ -1,18 +1,30 @@
 export default {
-    // SSR モードを有効に（本番環境向け）
-    ssr: true,
-    target: 'server',
-    // グローバルミドルウェア、プラグインの設定（認証、CSRF などを後で追加）
-    modules: [
-      '@nuxtjs/axios'
-    ],
-    axios: {
-      // API のベースURLは環境に合わせる（例：内部ネットワーク経由の場合）
-      baseURL: process.env.API_BASE_URL || 'https://auth.tororomeshi.net'
-    },
-    serverMiddleware: [
-      // 認証状態確認用のシンプルなエンドポイント例（本番では uniauth との連携やセッション検証を行う）
-      { path: '/api/me', handler: '~/serverMiddleware/me.js' }
-    ]
-  }
+  // SSR（サーバーサイドレンダリング）を有効にしたユニバーサルモード
+  ssr: true,
+  target: 'server',
   
+  // Global page headers
+  head: {
+    title: 'Portal Site',
+    meta: [
+      { charset: 'utf-8' },
+      { name: 'viewport', content: 'width=device-width, initial-scale=1' },
+      { hid: 'description', name: 'description', content: 'User portal for login and dashboard' }
+    ]
+  },
+
+  // Modules
+  modules: [
+    '@nuxtjs/axios'
+  ],
+  
+  axios: {
+    // 相対パスに設定することで、自身のオリジン（app.tororomeshi.net）にリクエストが送られる
+    baseURL: process.env.API_BASE_URL || '/'
+  },
+
+  // サーバーミドルウェア
+  serverMiddleware: [
+    { path: '/api/me', handler: '~/serverMiddleware/me.js' }
+  ]
+}
