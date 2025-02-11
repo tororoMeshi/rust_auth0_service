@@ -1,13 +1,17 @@
+// 必要なクレートのインポート
+use actix_web::cookie::{time::Duration, Cookie};
 use actix_web::{post, web, App, HttpRequest, HttpResponse, HttpServer, Responder};
 use chrono::{Duration as ChronoDuration, NaiveDateTime, Utc};
 use dotenv::dotenv;
 use jsonwebtoken::{encode, EncodingKey, Header};
 use log::{error, info};
-use rand::{distributions::Alphanumeric, Rng};
+use rand::distributions::Alphanumeric;
+use rand::thread_rng; // 直接インポート
+use rand::Rng;
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Postgres};
-use std::env; // 非同期の Redis コマンドを利用
+use std::env;
 
 //
 // === アプリケーション状態（Redis クライアント保持） ===
@@ -48,8 +52,10 @@ struct User {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
-    sub: String,
+    sub: String, // ユーザーID
     email: String,
+    name: String,
+    picture: String,
     exp: usize,
 }
 
@@ -80,10 +86,15 @@ async fn upsert_and_token(
                 db_user.id, db_user.google_id
             );
             // JWT を発行（有効期限 24 時間）
-            match generate_jwt(db_user.id, &db_user.email) {
+            match generate_jwt(
+                db_user.id,
+                &db_user.email,
+                db_user.name.as_deref().unwrap_or(""),
+                db_user.icon_url.as_deref().unwrap_or(""),
+            ) {
                 Ok(token) => {
                     // セッション ID を 24 文字のランダム文字列で生成
-                    let session_id: String = rand::thread_rng()
+                    let session_id: String = thread_rng()
                         .sample_iter(&Alphanumeric)
                         .take(24)
                         .map(char::from)
@@ -94,14 +105,14 @@ async fn upsert_and_token(
                         expires_at,
                     };
 
-                    // Redis にセッション情報を保存（SETEX コマンドで TTL を設定）
-                    let mut conn = match state.redis_client.get_async_connection().await {
-                        Ok(conn) => conn,
-                        Err(e) => {
-                            error!("Failed to get Redis connection: {:?}", e);
-                            return HttpResponse::InternalServerError()
-                                .body("Internal server error");
-                        }
+                    // Redis 接続取得部分（if let で早期リターン）
+                    let mut conn = if let Ok(conn) =
+                        state.redis_client.get_multiplexed_async_connection().await
+                    {
+                        conn
+                    } else {
+                        error!("Failed to get Redis multiplexed connection");
+                        return HttpResponse::InternalServerError().body("Internal server error");
                     };
 
                     let session_json = match serde_json::to_string(&session_data) {
@@ -165,7 +176,12 @@ async fn upsert_user(pool: &Pool<Postgres>, user_info: &UserInfo) -> Result<User
     Ok(record)
 }
 
-fn generate_jwt(user_id: i32, email: &str) -> Result<String, jsonwebtoken::errors::Error> {
+fn generate_jwt(
+    user_id: i32,
+    email: &str,
+    name: &str,
+    picture: &str,
+) -> Result<String, jsonwebtoken::errors::Error> {
     let secret_key = env::var("JWT_SECRET").unwrap_or_else(|_| "secret_key".to_string());
     let expiration = Utc::now()
         .checked_add_signed(ChronoDuration::hours(24))
@@ -174,6 +190,8 @@ fn generate_jwt(user_id: i32, email: &str) -> Result<String, jsonwebtoken::error
     let claims = Claims {
         sub: user_id.to_string(),
         email: email.to_string(),
+        name: name.to_string(),
+        picture: picture.to_string(),
         exp: expiration,
     };
     encode(
@@ -188,23 +206,34 @@ fn generate_jwt(user_id: i32, email: &str) -> Result<String, jsonwebtoken::error
 //
 
 #[post("/logout")]
-async fn logout(req: HttpRequest, state: web::Data<AppState>) -> impl Responder {
-    // クライアント送信の Cookie から session_id を抽出
+async fn logout(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Some(cookie) = req.cookie("session_id") {
         let session_id = cookie.value().to_string();
-        let mut conn = match state.redis_client.get_async_connection().await {
-            Ok(conn) => conn,
-            Err(e) => {
-                error!("Failed to get Redis connection: {:?}", e);
-                return HttpResponse::InternalServerError().body("Internal server error");
-            }
+        let mut conn = if let Ok(conn) = state.redis_client.get_multiplexed_async_connection().await
+        {
+            conn
+        } else {
+            error!("Failed to get Redis multiplexed connection");
+            return HttpResponse::InternalServerError().body("Internal server error");
         };
 
         let del_result: redis::RedisResult<()> = conn.del(&session_id).await;
         match del_result {
             Ok(_) => {
                 info!("Session {} deleted from Redis", session_id);
-                HttpResponse::Ok().body("Logged out")
+                let expired_session = Cookie::build("session_id", "")
+                    .path("/")
+                    .max_age(Duration::seconds(0))
+                    .finish();
+                let expired_jwt = Cookie::build("jwt", "")
+                    .path("/")
+                    .max_age(Duration::seconds(0))
+                    .finish();
+
+                HttpResponse::Ok()
+                    .cookie(expired_session)
+                    .cookie(expired_jwt)
+                    .body("Logged out")
             }
             Err(e) => {
                 error!("Failed to delete session from Redis: {:?}", e);
@@ -225,7 +254,6 @@ async fn main() -> std::io::Result<()> {
     dotenv().ok();
     env_logger::init();
 
-    // PostgreSQL 接続の設定
     let host = env::var("POSTGRES_HOST").expect("POSTGRES_HOST not set");
     let user = env::var("POSTGRES_USER").expect("POSTGRES_USER not set");
     let password = env::var("POSTGRES_PASSWORD").expect("POSTGRES_PASSWORD not set");
@@ -242,7 +270,6 @@ async fn main() -> std::io::Result<()> {
         }
     };
 
-    // Redis クライアントの初期化（REDIS_URL から取得）
     let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://redis:6379".to_string());
     let redis_client = redis::Client::open(redis_url).expect("Failed to create Redis client");
 

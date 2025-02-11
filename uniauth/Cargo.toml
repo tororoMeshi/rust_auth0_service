@@ -4,15 +4,15 @@ version = "0.5.0"
 edition = "2021"
 
 [dependencies]
-actix-web = "4.3"
+actix-web = "4.3.4"
+actix-session = { version = "0.10.1", features = ["redis-session"] }
 dotenv = "0.15"
 env_logger = "0.11"
 log = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-jsonwebtoken = "9.3"
+jsonwebtoken = "9.3.1"
 rand = "0.8"
-sqlx = { version = "0.6", features = ["postgres", "runtime-tokio-native-tls", "chrono"] }
-chrono = { version = "0.4", features = ["serde"] }
-# Redis を非同期で利用するため、tokio-comp 機能を有効にします
-redis = { version = "0.21", features = ["tokio-comp"] }
+sqlx = { version = "0.8.3", features = ["postgres", "runtime-tokio-native-tls", "chrono"] }
+chrono = { version = "0.4.31", features = ["serde"] }
+redis = { version = "0.28.2", features = ["tokio-comp"] }

@@ -1,12 +1,13 @@
 # Stage 1: Build the Nuxt.js application
 FROM node:23-bookworm AS builder
 
-# 作業ディレクトリを設定
 WORKDIR /app
 
 # package.json と package-lock.json をコピーし依存関係をインストール
 COPY package*.json ./
 RUN npm install
+# cookie パッケージが package.json に含まれていない場合は、ここでインストール
+RUN npm install cookie
 
 # ソースコードを全てコピーしてビルド
 COPY . .

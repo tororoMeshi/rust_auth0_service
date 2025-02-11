@@ -1,31 +1,35 @@
 // serverMiddleware/me.js
-export default function (req, res, next) {
-  const cookieHeader = req.headers.cookie;
-  if (!cookieHeader) {
+
+const jwt = require('jsonwebtoken');
+const cookie = require('cookie');
+
+// JWT_SECRET を環境変数から取得。必ず本番環境では安全に管理してください。
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  console.error("JWT_SECRET environment variable is not set.");
+  // 本番環境では、起動前に必ず設定すること
+}
+
+module.exports = function (req, res, next) {
+  // cookie パッケージを使用して、リクエストヘッダーからクッキーをパース
+  const cookies = cookie.parse(req.headers.cookie || '');
+
+  if (!cookies.jwt) {
     res.statusCode = 401;
     res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify({ error: 'Not authenticated' }));
+    res.end(JSON.stringify({ error: 'Not authenticated: JWT missing' }));
     return;
   }
-  const cookies = {};
-  cookieHeader.split(';').forEach(cookie => {
-    const parts = cookie.split('=');
-    cookies[parts[0].trim()] = (parts[1] || '').trim();
-  });
-  
-  // ここでは session_id が存在すれば認証済みと判断
-  if (cookies.session_id) {
+
+  try {
+    // JWT の署名検証を実施
+    const decoded = jwt.verify(cookies.jwt, JWT_SECRET);
     res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify({
-      user: {
-        id: 1,
-        email: 'user@example.com',
-        name: 'Demo User'
-      }
-    }));
-  } else {
+    res.end(JSON.stringify({ user: decoded }));
+  } catch (err) {
+    console.error("JWT verification failed:", err);
     res.statusCode = 401;
     res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify({ error: 'Not authenticated' }));
+    res.end(JSON.stringify({ error: 'Invalid JWT', details: err.message }));
   }
-}
+};

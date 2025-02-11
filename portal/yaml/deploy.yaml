@@ -23,3 +23,9 @@ spec:
           # 必要に応じて環境変数を設定（例: API_BASE_URL など）
           - name: API_BASE_URL
             value: "https://auth.tororomeshi.net"
+          # JWT 署名用の秘密鍵も Kubernetes Secret で管理するのが安全
+          - name: JWT_SECRET
+            valueFrom:
+              secretKeyRef:
+                name: uniauth-secrets
+                key: jwt_secret
