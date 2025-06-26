@@ -1,3 +1,4 @@
+<!-- pages/dashboard.vue -->
 <template>
   <div class="dashboard">
     <h1>Dashboard</h1>
@@ -5,6 +6,9 @@
       <img :src="user.picture" alt="User Icon" style="max-width:100px; border-radius:50%;">
       <p><strong>Email:</strong> {{ user.email }}</p>
       <p><strong>Name:</strong> {{ user.name }}</p>
+      <!-- 追加：チャットアプリへ移動するためのボタン -->
+      <button @click="joinChat">Join Chat</button>
+      <!-- 既存：ログアウトボタン -->
       <button @click="logout">Logout</button>
     </div>
     <div v-else>
@@ -24,6 +28,7 @@ export default {
     await this.fetchUser();
   },
   methods: {
+    // ユーザー情報取得 API (/api/me) を呼び出し、認証済みのユーザー情報を取得
     async fetchUser() {
       try {
         const res = await this.$axios.get('/api/me', { withCredentials: true });
@@ -39,6 +44,7 @@ export default {
         this.$router.push({ path: '/login-error', query: { error: e.message || "Unknown error" } });
       }
     },
+    // ログアウト処理（認証サーバー側の /logout API を呼び出す）
     async logout() {
       try {
         await this.$axios.post('https://auth.tororomeshi.net/uniauth/logout', {}, { withCredentials: true });
@@ -47,6 +53,11 @@ export default {
       } finally {
         window.location.href = '/';
       }
+    },
+    // 【新規追加】チャットアプリへ遷移する処理
+    joinChat() {
+      // 例：Stateless Chat の部屋一覧ページへ遷移
+      window.location.href = 'https://chat.tororomeshi.net/rooms.html';
     }
   }
 }

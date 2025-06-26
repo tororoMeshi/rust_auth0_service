@@ -18,6 +18,9 @@ FROM node:23-bookworm-slim
 
 WORKDIR /app
 
+# セキュリティアップデートを適用
+RUN apt-get update && apt-get upgrade -y && apt-get clean && rm -rf /var/lib/apt/lists/*
+
 # ビルド済みのアプリケーションをコピー
 COPY --from=builder /app ./
 

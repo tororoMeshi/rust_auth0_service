@@ -11,6 +11,9 @@ if (!JWT_SECRET) {
 }
 
 module.exports = function (req, res, next) {
+  // アクセスログを出力
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url} - IP: ${req.connection.remoteAddress}`);
+  
   // cookie パッケージを使用して、リクエストヘッダーからクッキーをパース
   const cookies = cookie.parse(req.headers.cookie || '');
 
