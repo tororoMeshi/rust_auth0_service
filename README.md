@@ -5,13 +5,15 @@ OAuth2認証とJWT管理を提供するRust製マイクロサービス群です�
 ## アーキテクチャ
 
 ```
-[Frontend (Vue.js)] 
+[User Browser] 
     ↓ HTTPS
 [Cloudflare Tunnel] 
-    ↓ HTTP
-[Nginx + Portal Backend (Rust)] ←→ [Auth Service (Rust)] ←→ [Uniauth Service (Rust)]
-                                              ↓                        ↓
-                                    [Google OAuth2]              [PostgreSQL + Redis]
+    ↓ HTTP (Kubernetes内)
+[Frontend (Vue.js/Nginx)] ←→ [Portal Backend (Rust)] ←→ [Auth Service (Rust)] ←→ [Uniauth Service (Rust)]
+           ↓ HTTP (Pod間通信)              ↓ HTTP (Pod間通信)              ↓ HTTP (Pod間通信)           ↓
+    (静的ファイル配信)                  (JWT認証API)                (OAuth2認証)            [PostgreSQL + Redis]
+                                                                    ↓
+                                                            [Google OAuth2]
 ```
 
 ## 本番環境に必要なコンポーネント
@@ -48,10 +50,16 @@ OAuth2認証とJWT管理を提供するRust製マイクロサービス群です�
 
 ## テスト・開発用コンポーネント
 
-### 旧実装（参考用）
-- **portal-backend/** - Express.js版バックエンド（非推奨）
-- **uniauth/src/ok_main.rs** - 旧バージョン実装
-- **rust-auth0-service/src/ver2_auth_main.rs** - 旧認証フロー
+### 旧実装（参考用・削除済み）
+- **~~portal-backend/~~** - Express.js版バックエンド（削除済み）
+- **uniauth/src/ok_main.rs** - 旧バージョン実装（参考用）
+- **rust-auth0-service/src/ver2_auth_main.rs** - 旧認証フロー（参考用）
+
+### 開発支援ファイル
+- **portal/lint.sh**, **uniauth/lint.sh** - コードリンター
+- **portal/.eslintrc.\*** - ESLint設定
+- **portal/Dockerfile.nginx** - 代替Dockerファイル
+- **portal/scripts/** - デプロイスクリプト
 
 ## 環境変数
 
