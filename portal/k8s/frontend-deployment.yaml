@@ -1,0 +1,78 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend-deployment
+  namespace: auth0
+  labels:
+    app: frontend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      # ← 非rootで動かし、emptyDirの所有グループを合わせる
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001        # ← ここを 10001 に変えてもOK（Dockerfileに合わせる）
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+      - name: frontend
+        image: tororomeshi/portal-frontend:latest
+        # Nginx が 80 で listen している想定。nginx.conf を 8080 にしているなら 8080 に変更。
+        ports:
+        - containerPort: 8080
+        # ルートFSをread-onlyにして、書込みが要る場所だけemptyDirをマウント
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+        volumeMounts:
+        - name: nginx-config
+          mountPath: /etc/nginx/nginx.conf
+          subPath: nginx.conf
+        # ★ Nginx が書く場所を writable にする
+        - name: nginx-cache
+          mountPath: /var/cache/nginx
+        - name: nginx-run
+          mountPath: /var/run
+        # （保険）一部スクリプトや一時ファイル用に /tmp も writable に
+        - name: tmp
+          mountPath: /tmp
+        # ヘルスチェックのパスは nginx.conf と揃える（/health or /healthz）
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+      volumes:
+      - name: nginx-config
+        configMap:
+          name: frontend-config
+      # ★ 書込み用 emptyDir を追加
+      - name: nginx-cache
+        emptyDir: {}
+      - name: nginx-run
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
