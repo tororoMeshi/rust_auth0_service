@@ -10,10 +10,9 @@ OAuth2認証とJWT管理を提供するRust製マイクロサービス群です�
 [Cloudflare Tunnel] 
     ↓ HTTP (Kubernetes内)
 [Frontend (Vue.js/Nginx)] ←→ [Portal Backend (Rust)] ←→ [Auth Service (Rust)] ←→ [Uniauth Service (Rust)]
-           ↓ HTTP (Pod間通信)              ↓ HTTP (Pod間通信)              ↓ HTTP (Pod間通信)           ↓
-    (静的ファイル配信)                  (JWT認証API)                (OAuth2認証)            [PostgreSQL + Redis]
-                                                                    ↓
-                                                            [Google OAuth2]
+    (静的ファイル配信)  HTTP (Pod間通信)        HTTP (Pod間通信)             HTTP (Pod間通信)
+                                                                ↓ HTTPS (外部API)             ↓ Pod間通信
+                                                            [Google OAuth2]          [PostgreSQL + Redis]
 ```
 
 ## 本番環境に必要なコンポーネント
