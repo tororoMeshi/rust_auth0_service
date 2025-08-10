@@ -4,10 +4,10 @@ metadata:
   name: nuxt-portal-ingress
   namespace: auth0
   annotations:
-    ingressClassName: "cloudflare"  # 使用しているIngressコントローラに応じて変更
+    ingressClassName: "cloudflare"
 spec:
   rules:
-  - host: app.tororomeshi.net
+  - host: portal.tororomeshi.net
     http:
       paths:
       - path: /

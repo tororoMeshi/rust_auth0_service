@@ -2,7 +2,7 @@
 FROM rust:latest AS builder
 
 # 作業ディレクトリの設定
-WORKDIR /usr/src/app
+WORKDIR /app
 
 # ソースコードのコピー
 COPY . .
@@ -11,26 +11,16 @@ COPY . .
 RUN cargo build --release
 
 # 実行用のスリムなイメージを作成
-FROM debian:bookworm-slim
-
-# 必要なライブラリのインストール
-RUN apt-get update \
-    && apt-get install -y pkg-config libssl-dev ca-certificates \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+FROM gcr.io/distroless/cc-debian12:nonroot
 
 # 作業ディレクトリの設定
-WORKDIR /usr/src/app
+WORKDIR /app
 
 # ビルドしたバイナリをコピー
-COPY --from=builder /usr/src/app/target/release/uniauth /usr/local/bin/uniauth
+COPY --from=builder /app/target/release/uniauth /app/uniauth
 
 # ポートの公開
 EXPOSE 8080
 
-# 環境変数を設定
-# COPY .env /usr/src/app/.env
-
 # コンテナ起動時に実行するコマンド
-# CMD ["rust-auth0-service"]
-CMD ["/usr/local/bin/uniauth"]
+CMD ["/app/uniauth"]

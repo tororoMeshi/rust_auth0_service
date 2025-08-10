@@ -1,0 +1,79 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tororomeshi-portal
+  namespace: auth0
+  labels: { app: tororomeshi-portal }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: tororomeshi-portal }
+  template:
+    metadata:
+      labels: { app: tororomeshi-portal }
+    spec:
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        runAsNonRoot: true
+      containers:
+        - name: tororomeshi-portal
+          image: tororomeshi/tororomeshi-portal:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "250m"
+              memory: "128Mi"
+          volumeMounts:
+            - name: nginx-cache
+              mountPath: /var/cache/nginx
+            - name: nginx-run
+              mountPath: /var/run
+          env:
+            # 必要に応じて環境変数を設定（例: API_BASE_URL など）
+            - name: API_BASE_URL
+              value: "https://auth.tororomeshi.net"
+            # JWT 署名用の秘密鍵も Kubernetes Secret で管理するのが安全
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: uniauth-secrets
+                  key: jwt_secret
+      volumes:
+        - name: nginx-cache
+          emptyDir: {}
+        - name: nginx-run
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tororomeshi-portal
+  namespace: auth0
+  labels: { app: tororomeshi-portal }
+spec:
+  type: ClusterIP
+  selector: { app: tororomeshi-portal }
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: 8080

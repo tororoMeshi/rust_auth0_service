@@ -1,34 +1,18 @@
-# Stage 1: Build the Nuxt.js application
-FROM node:23-bookworm AS builder
+FROM node:18-alpine as build-stage
 
 WORKDIR /app
 
-# package.json と package-lock.json をコピーし依存関係をインストール
 COPY package*.json ./
-RUN npm install
-# cookie パッケージが package.json に含まれていない場合は、ここでインストール
-RUN npm install cookie
+RUN npm ci
 
-# ソースコードを全てコピーしてビルド
 COPY . .
 RUN npm run build
 
-# Stage 2: 実行用イメージの作成
-FROM node:23-bookworm-slim
+FROM nginx:alpine
 
-WORKDIR /app
+COPY --from=build-stage /app/dist /usr/share/nginx/html
+COPY nginx.conf /etc/nginx/nginx.conf
 
-# セキュリティアップデートを適用
-RUN apt-get update && apt-get upgrade -y && apt-get clean && rm -rf /var/lib/apt/lists/*
+EXPOSE 80
 
-# ビルド済みのアプリケーションをコピー
-COPY --from=builder /app ./
-
-# Nuxt.js のサーバーは通常 3000 番ポートで起動するので EXPOSE
-EXPOSE 3000
-
-# 環境変数 HOST を 0.0.0.0 に設定（コンテナ内で外部からアクセスできるように）
-ENV HOST=0.0.0.0
-
-# アプリケーションを起動
-CMD ["npm", "start"]
+CMD ["nginx", "-g", "daemon off;"]

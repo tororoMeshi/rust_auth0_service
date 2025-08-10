@@ -1,39 +1,64 @@
-#!/bin/bash
-# This script builds a Docker image and pushes it to Docker Hub.
-# Usage: ./push_docker.sh [IMAGE_TAG]
-# Make sure you are logged in to Docker Hub before running this script.
+#!/usr/bin/env bash
+set -euo pipefail
 
-set -eu
+# ========================
+# Config
+# ========================
+: "${DOCKERHUB_USER:?Set DOCKERHUB_USER}"   # 例: export DOCKERHUB_USER=tororomeshi
+APP_NAME="${APP_NAME:-portal-frontend}"            # リポジトリ名（lint.sh に合わせた既定）
+IMAGE="${DOCKERHUB_USER}/${APP_NAME}"
+DOCKERFILE="${DOCKERFILE:-Dockerfile.nginx}"
+CONTEXT_DIR="${CONTEXT_DIR:-.}"
 
-IMAGE_NAME="tororomeshi/nuxt-portal"
-IMAGE_TAG="${1:-0.1}"
+# TAG は引数 or git の短SHA or 日時フォールバック
+TAG="${1:-$(git rev-parse --short HEAD 2>/dev/null || date +%Y%m%d%H%M)}"
 
-# Check script directory
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-cd "${SCRIPT_DIR}"
+# Multi-arch を使う場合は MULTIARCH=1 をセット
+MULTIARCH="${MULTIARCH:-0}"
+PLATFORMS="${PLATFORMS:-linux/amd64,linux/arm64}"
 
-# Build image
-echo "Building Docker image..."
-if ! docker build -t "${IMAGE_NAME}:${IMAGE_TAG}" -t "${IMAGE_NAME}:latest" .; then
-  echo "Docker build failed." >&2
-  exit 1
+echo "==> IMAGE:        ${IMAGE}"
+echo "==> DOCKERFILE:   ${DOCKERFILE}"
+echo "==> CONTEXT:      ${CONTEXT_DIR}"
+echo "==> TAG:          ${TAG}"
+echo "==> MULTIARCH:    ${MULTIARCH} (platforms: ${PLATFORMS})"
+
+# ちょっとした安全策: Dockerfile 存在チェック
+[[ -f "${DOCKERFILE}" ]] || { echo "Dockerfile not found: ${DOCKERFILE}" >&2; exit 1; }
+
+# ========================
+# Build & Push
+# ========================
+if [[ "${MULTIARCH}" == "1" ]]; then
+  # buildx でそのまま push（ビルド済みローカルイメージは残らない）
+  echo "==> Using buildx (multi-arch) build & push..."
+  docker buildx inspect >/dev/null 2>&1 || docker buildx create --use
+  docker buildx build \
+    --platform "${PLATFORMS}" \
+    -f "${DOCKERFILE}" \
+    -t "${IMAGE}:${TAG}" \
+    -t "${IMAGE}:latest" \
+    --push \
+    "${CONTEXT_DIR}"
+
+  echo "==> Inspect pushed image manifest:"
+  docker buildx imagetools inspect "${IMAGE}:${TAG}" || true
+else
+  # 通常の docker build -> push
+  echo "==> Building (single arch) image..."
+  DOCKER_BUILDKIT=1 docker build \
+    -f "${DOCKERFILE}" \
+    -t "${IMAGE}:${TAG}" \
+    -t "${IMAGE}:latest" \
+    "${CONTEXT_DIR}"
+
+  echo "==> Pushing ${IMAGE}:${TAG} ..."
+  docker push "${IMAGE}:${TAG}"
+
+  echo "==> Pushing ${IMAGE}:latest ..."
+  docker push "${IMAGE}:latest"
 fi
 
-# Function to push image and handle authentication errors
-push_image() {
-  local TAG=$1
-  echo "Pushing Docker image with tag ${TAG}..."
-  if ! docker push "${IMAGE_NAME}:${TAG}"; then
-    echo "Docker push failed for tag ${TAG}." >&2
-    echo "Please make sure you are logged in to Docker Hub by running 'docker login'." >&2
-    exit 1
-  fi
-}
-
-# Push image with specific tag
-push_image "${IMAGE_TAG}"
-
-# Push image with latest tag
-push_image "latest"
-
-echo "Docker image pushed successfully."
+echo "✅ Done. Pushed:"
+echo "   - ${IMAGE}:${TAG}"
+echo "   - ${IMAGE}:latest"

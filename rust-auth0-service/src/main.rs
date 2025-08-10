@@ -1,3 +1,5 @@
+// src/main.rs for rust-auth0-service
+
 // 必要なクレートのインポート
 #[allow(unused_imports)]
 use actix_cors::Cors;
@@ -11,7 +13,7 @@ use actix_web::{get, web, App, HttpResponse, HttpServer};
 use dotenv::dotenv;
 use log::{error, info};
 use oauth2::reqwest::async_http_client;
-use oauth2::TokenResponse; // access_token() などのメソッドを利用するため
+use oauth2::TokenResponse;
 use oauth2::{
     basic::BasicClient, AuthUrl, AuthorizationCode, ClientId, ClientSecret, RedirectUrl, TokenUrl,
 };
@@ -19,18 +21,16 @@ use rand::{distributions::Alphanumeric, Rng};
 use serde::{Deserialize, Serialize};
 use std::env;
 
-//
-// === OAuth フローとセッション管理のハンドラ ===
-//
-
+// クエリパラメータ用構造体
 #[derive(Debug, Deserialize)]
 struct StartAuthQuery {
     redirect: Option<String>,
 }
 
+// Google OAuth 認証開始エンドポイント
 #[get("/auth/google")]
 async fn start_google_auth(session: Session, query: web::Query<StartAuthQuery>) -> HttpResponse {
-    // 1. CSRF 対策: ランダムな state を生成し、セッションに保存
+    // CSRF 対策用の state を生成しセッションに保存
     let state: String = rand::thread_rng()
         .sample_iter(&Alphanumeric)
         .take(16)
@@ -38,18 +38,20 @@ async fn start_google_auth(session: Session, query: web::Query<StartAuthQuery>) 
         .collect();
     if let Err(e) = session.insert("oauth_state", state.clone()) {
         error!("Failed to insert oauth_state: {:?}", e);
-        return HttpResponse::InternalServerError().finish();
+        return HttpResponse::InternalServerError()
+            .body("Internal server error: cannot set oauth_state");
     }
 
-    // 2. ログイン前のリダイレクト先をセッションに保存
+    // ログイン前のリダイレクト先をセッションに保存
     if let Some(ref redirect) = query.redirect {
         if let Err(e) = session.insert("redirect", redirect) {
             error!("Failed to insert redirect: {:?}", e);
-            return HttpResponse::InternalServerError().finish();
+            return HttpResponse::InternalServerError()
+                .body("Internal server error: cannot set redirect");
         }
     }
 
-    // 3. Google OAuth 認可 URL を生成（state パラメータ付き）
+    // Google OAuth 認可 URL を生成
     let client_id = env::var("GOOGLE_CLIENT_ID").expect("GOOGLE_CLIENT_ID not set");
     let redirect_uri = env::var("GOOGLE_REDIRECT_URI").expect("GOOGLE_REDIRECT_URI not set");
     let auth_url = format!(
@@ -79,14 +81,15 @@ struct UserInfo {
 
 #[get("/auth/google/callback")]
 async fn google_auth_callback(session: Session, query: web::Query<CallbackQuery>) -> HttpResponse {
-    // 4. セッションに保存された state と受信した state を比較（CSRF 対策）
+    // セッションに保存された state と受信した state の比較（CSRF 対策）
     let stored_state: Option<String> = session.get("oauth_state").unwrap_or(None);
     if stored_state.is_none() || stored_state.unwrap() != query.state {
         error!("State parameter mismatch. Potential CSRF attack.");
-        return HttpResponse::BadRequest().body("Invalid state parameter");
+        return HttpResponse::BadRequest()
+            .body("Invalid state parameter. Please try logging in again.");
     }
 
-    // 5. Google からアクセストークンを取得
+    // Google からアクセストークンを取得
     let client_id = env::var("GOOGLE_CLIENT_ID").expect("GOOGLE_CLIENT_ID not set");
     let client_secret = env::var("GOOGLE_CLIENT_SECRET").expect("GOOGLE_CLIENT_SECRET not set");
     let redirect_uri = env::var("GOOGLE_REDIRECT_URI").expect("GOOGLE_REDIRECT_URI not set");
@@ -111,18 +114,17 @@ async fn google_auth_callback(session: Session, query: web::Query<CallbackQuery>
                 Ok(user_info) => {
                     match request_session_from_uniauth(&user_info).await {
                         Ok(session_data) => {
-                            // 7. セッションに保存されたリダイレクト先を取得（デフォルトは "/"）
+                            // セッションに保存されたリダイレクト先を取得（デフォルトは "/"）
                             let raw_redirect: String = session
                                 .get("redirect")
                                 .unwrap_or(Some("/".to_string()))
                                 .unwrap_or("/".to_string());
-                            // もしリダイレクト先が相対パスなら、ポータルサイトのドメインを付加
                             let redirect_url = if raw_redirect.starts_with('/') {
-                                format!("https://app.tororomeshi.net{}", raw_redirect)
-                            } else if raw_redirect.starts_with("https://app.tororomeshi.net") {
+                                format!("https://portal.tororomeshi.net{}", raw_redirect)
+                            } else if raw_redirect.starts_with("https://portal.tororomeshi.net") {
                                 raw_redirect
                             } else {
-                                "https://app.tororomeshi.net/".to_string()
+                                "https://portal.tororomeshi.net/".to_string()
                             };
 
                             let cookie_domain = env::var("COOKIE_DOMAIN")
@@ -154,19 +156,22 @@ async fn google_auth_callback(session: Session, query: web::Query<CallbackQuery>
                         }
                         Err(e) => {
                             error!("Error from uniauth: {:?}", e);
-                            HttpResponse::InternalServerError().body("Failed to generate session")
+                            HttpResponse::InternalServerError()
+                                .body("Failed to generate session. Please try again later.")
                         }
                     }
                 }
                 Err(err) => {
                     error!("Failed to get user info: {:?}", err);
-                    HttpResponse::InternalServerError().body("Failed to get user info")
+                    HttpResponse::InternalServerError()
+                        .body("Failed to get user info. Please try again later.")
                 }
             }
         }
         Err(err) => {
             error!("Error exchanging code: {:?}", err);
-            HttpResponse::BadRequest().body("Error exchanging code")
+            HttpResponse::BadRequest()
+                .body("Error exchanging code. Please retry the login process.")
         }
     }
 }
@@ -209,26 +214,22 @@ async fn request_session_from_uniauth(
     Ok(session_data)
 }
 
-//
-// === メイン処理 ===
-//
-
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     dotenv().ok();
     env_logger::init();
 
-    // CORS の設定を追加
+    // CORS の設定
     use actix_cors::Cors;
     use actix_web::http::header;
 
-    // RedisSessionStore を REDIS_URL から初期化
+    // RedisSessionStore の初期化
     let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://redis:6379".to_string());
     let redis_store = RedisSessionStore::new(redis_url)
         .await
         .expect("Failed to create Redis session store");
 
-    // セッション Cookie 署名用の秘密鍵（Key 型に変換）
+    // セッション Cookie 署名用の秘密鍵
     let secret_key = env::var("SESSION_SECRET_KEY")
         .unwrap_or_else(|_| "0123456789abcdef0123456789abcdef".to_string());
 
@@ -236,7 +237,7 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .wrap(
                 Cors::default()
-                    .allowed_origin("https://app.tororomeshi.net")
+                    .allowed_origin("https://portal.tororomeshi.net")
                     .allowed_origin("https://auth.tororomeshi.net")
                     .allowed_methods(vec!["GET", "POST", "OPTIONS"])
                     .allowed_headers(vec![

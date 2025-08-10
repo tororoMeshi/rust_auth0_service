@@ -2,20 +2,26 @@
   "name": "portal-site",
   "version": "1.0.0",
   "scripts": {
-    "dev": "nuxt",
-    "build": "nuxt build",
-    "start": "nuxt start",
-    "lint": "eslint --ext .js,.vue .",
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "lint": "eslint --ext .js,.vue --ignore-pattern dist .",
+    "lint:fix": "eslint --ext .js,.vue --ignore-pattern dist . --fix",
     "format": "prettier --check ."
   },
   "dependencies": {
-    "nuxt": "^2.15.8",
-    "axios": "^0.27.2",
-    "@nuxtjs/axios": "^5.13.6",
-    "jsonwebtoken": "^9.0.0"
+    "axios": "^1.4.0",
+    "vue": "^3.3.4",
+    "vue-router": "^4.2.4"
   },
   "devDependencies": {
+    "@vitejs/plugin-vue": "^4.3.4",
+    "vite": "^4.4.9",
+    "@babel/eslint-parser": "^7.0.0",
     "eslint": "^8.45.0",
-    "prettier": "^3.0.0"
+    "eslint-config-prettier": "^9.0.0",
+    "eslint-plugin-vue": "^9.0.0",
+    "prettier": "^3.0.0",
+    "vue-eslint-parser": "^9.0.0"
   }
 }
