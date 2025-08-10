@@ -46,7 +46,7 @@ spec:
           valueFrom:
             secretKeyRef:
               name: uniauth-secrets
-              key: JWT_SECRET
+              key: jwt_secret
 
           # RedisにアクセスするためのURL
         - name: REDIS_URL

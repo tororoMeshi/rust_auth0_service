@@ -1,29 +1,27 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
+
 # ファイル名: create_uniauth_secret.sh
-# 用途: OpenSSLでランダム文字列を生成し、Kubernetes Secret (jwt_secret) を
-#       auth0 および stateless-chat の両方のNamespaceに作成/更新する
-#
-# 使用例:
-#   ./create_uniauth_secret.sh
+# 用途: 同一 JWT シークレットを複数 Namespace に作成/更新
 
-# 対象とする Namespace のリスト
 NAMESPACES=("auth0" "stateless-chat" "jamaica")
-
-# Secret 名と Secret 中のキー名
 SECRET_NAME="uniauth-secrets"
 SECRET_KEY_NAME="jwt_secret"
 
-# ランダムな文字列を生成 (32バイト=256bit)
-RANDOM_SECRET=$(openssl rand -hex 32)
-echo "Generated random secret: $RANDOM_SECRET"
+# 32バイト(=256bit)のランダムHEX
+RANDOM_SECRET="$(openssl rand -hex 32)"
 
-# 各 Namespace に対して Secret を作成/更新する
+# ログには値を出さず、指紋だけ出す
+FINGERPRINT="$(printf '%s' "$RANDOM_SECRET" | sha256sum | cut -d' ' -f1)"
+echo "Generated new JWT secret (sha256 fingerprint): $FINGERPRINT"
+
 for NAMESPACE in "${NAMESPACES[@]}"; do
-  echo "Creating/updating secret '$SECRET_NAME' in namespace '$NAMESPACE'..."
+  echo "Applying secret '$SECRET_NAME' to namespace '$NAMESPACE'..."
   kubectl create secret generic "$SECRET_NAME" \
     --namespace "$NAMESPACE" \
-    --from-literal="$SECRET_KEY_NAME"="$RANDOM_SECRET" \
+    --from-literal="$SECRET_KEY_NAME=$RANDOM_SECRET" \
     --dry-run=client -o yaml | kubectl apply -f -
 done
 
-echo "Kubernetes Secret '$SECRET_NAME' has been created/updated in namespaces: ${NAMESPACES[*]}"
+echo "✅Done. Remember to rollout restart the deployments that consume this secret."
+

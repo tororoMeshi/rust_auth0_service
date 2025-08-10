@@ -31,7 +31,7 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: uniauth-secrets
-                  key: JWT_SECRET
+                  key: jwt_secret
             - name: RUST_LOG
               value: "info"
           ports:
