@@ -43,7 +43,7 @@ export default {
 
     const logout = async () => {
       try {
-        await apiClient.post('https://auth.tororomeshi.net/uniauth/logout')
+        await apiClient.post('https://auth.tororomeshi.net/auth/logout')
       } catch (e) {
         console.error("Logout failed:", e)
       } finally {
