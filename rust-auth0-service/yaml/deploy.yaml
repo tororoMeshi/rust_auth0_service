@@ -34,6 +34,8 @@ spec:
             value: "https://auth.tororomeshi.net/auth/google/callback"
           - name: APP_BASE_URL
             value: "https://portal.tororomeshi.net"
+          - name: POST_LOGIN_REDIRECT
+            value: "https://portal.tororomeshi.net/dashboard"
           - name: ALLOWED_REDIRECT_ORIGINS
             value: "https://portal.tororomeshi.net"
           - name: ALLOWED_CORS_ORIGINS

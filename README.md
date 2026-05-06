@@ -73,6 +73,7 @@ GOOGLE_CLIENT_ID=<Google OAuth2クライアントID>
 GOOGLE_CLIENT_SECRET=<Google OAuth2クライアントシークレット>
 GOOGLE_REDIRECT_URI=https://auth.example.com/auth/google/callback
 APP_BASE_URL=https://app.example.com
+POST_LOGIN_REDIRECT=https://app.example.com/dashboard
 ALLOWED_REDIRECT_ORIGINS=https://app.example.com
 ALLOWED_CORS_ORIGINS=https://app.example.com,https://auth.example.com
 UNIAUTH_URL=http://uniauth:8081
@@ -88,9 +89,6 @@ DB_NAME=auth0_accounts
 REDIS_URL=redis://rfrm-redisfailover:6379
 APP_BASE_URL=https://app.example.com
 FRONTEND_ORIGIN=https://app.example.com
-COOKIE_DOMAIN=.example.com
-COOKIE_SECURE=true
-POST_LOGIN_REDIRECT=https://app.example.com/dashboard
 ```
 
 ### portal_backend
@@ -151,11 +149,12 @@ kubectl apply -k portal/k8s/
 
 ### Auth Service (`rust-auth0-service`)
 - `GET /auth/google` - Google OAuth2認証開始
-- `GET /callback` - OAuth2コールバック
+- `GET /auth/google/callback` - OAuth2コールバック
+- `POST /auth/logout` - Cookie失効とセッション削除
 
 ### Uniauth (`uniauth`)
-- `POST /upsert_and_token` - ユーザー登録・JWT発行
-- `POST /logout` - ログアウト・セッション削除
+- `POST /upsert_and_token` - ユーザー登録・JWT発行・セッション作成
+- `POST /logout` - セッション削除
 
 ## 開発・テスト
 
@@ -181,7 +180,7 @@ kubectl logs -n auth0 -l app=frontend
 
 1. **JWT署名エラー** - `uniauth` と `portal_backend` のJWT_SECRETが一致していることを確認
 2. **DNS解決エラー** - Cloudflare DNSでCNAMEレコードが正しく設定されていることを確認
-3. **Cookie設定エラー** - `COOKIE_DOMAIN` と `COOKIE_SECURE` の設定を確認
+3. **Cookie設定エラー** - `rust-auth0-service` の `COOKIE_DOMAIN` と `POST_LOGIN_REDIRECT` の設定を確認
 
 ### デバッグ手順
 

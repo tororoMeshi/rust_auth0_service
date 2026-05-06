@@ -1,7 +1,6 @@
 // uniauth/src/main.rs
 
 use actix_cors::Cors;
-use actix_web::cookie::{time::Duration, Cookie, SameSite};
 use actix_web::{
     get, http::header, post, web, App, HttpRequest, HttpResponse, HttpServer, Responder,
 };
@@ -23,41 +22,8 @@ fn app_base_url() -> String {
         .to_string()
 }
 
-fn cookie_domain() -> Option<String> {
-    env::var("COOKIE_DOMAIN")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-fn cookie_secure() -> bool {
-    env::var("COOKIE_SECURE")
-        .map(|value| value == "true" || value == "1")
-        .unwrap_or(true)
-}
-
-fn post_login_redirect() -> String {
-    env::var("POST_LOGIN_REDIRECT").unwrap_or_else(|_| format!("{}/dashboard", app_base_url()))
-}
-
 fn frontend_origin() -> String {
     env::var("FRONTEND_ORIGIN").unwrap_or_else(|_| app_base_url())
-}
-
-fn build_auth_cookie(name: &'static str, value: String, max_age: Duration) -> Cookie<'static> {
-    let mut builder = Cookie::build(name, value)
-        .path("/")
-        .max_age(max_age)
-        .http_only(true)
-        .same_site(SameSite::None);
-
-    if let Some(domain) = cookie_domain() {
-        builder = builder.domain(domain);
-    }
-
-    let mut cookie = builder.finish();
-    cookie.set_secure(cookie_secure());
-    cookie
 }
 
 #[derive(Clone)]
@@ -115,8 +81,6 @@ async fn upsert_and_token(
 ) -> impl Responder {
     info!("Received /upsert_and_token request: {:?}", user_info);
 
-    let response_mode = env::var("RESPONSE_MODE").unwrap_or_else(|_| "json".to_string()); // "json" or "redirect"
-
     // upsert
     let db_user = match upsert_user(&pool, &user_info).await {
         Ok(u) => u,
@@ -173,29 +137,11 @@ async fn upsert_and_token(
             .body("Internal server error: Failed to store session");
     }
 
-    // Cookie 作成（SameSite=None + Secure、本番必須）
-    let max_age = Duration::seconds(24 * 3600);
-
-    let jwt_cookie = build_auth_cookie("jwt", token.clone(), max_age);
-    let sid_cookie = build_auth_cookie("session_id", session_id.clone(), max_age);
-
-    // 返し方を選択：JSON or 302 リダイレクト
-    if response_mode == "redirect" {
-        HttpResponse::Found()
-            .insert_header((header::LOCATION, post_login_redirect()))
-            .cookie(jwt_cookie)
-            .cookie(sid_cookie)
-            .finish()
-    } else {
-        HttpResponse::Ok()
-            .cookie(jwt_cookie)
-            .cookie(sid_cookie)
-            .json(SessionResponse {
-                session_id,
-                token,
-                user: db_user,
-            })
-    }
+    HttpResponse::Ok().json(SessionResponse {
+        session_id,
+        token,
+        user: db_user,
+    })
 }
 
 #[post("/logout")]
@@ -215,14 +161,7 @@ async fn logout(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
         }
     }
 
-    // 有効期限 0 で無効化
-    let expired_session = build_auth_cookie("session_id", "".to_string(), Duration::seconds(0));
-    let expired_jwt = build_auth_cookie("jwt", "".to_string(), Duration::seconds(0));
-
-    HttpResponse::Ok()
-        .cookie(expired_session)
-        .cookie(expired_jwt)
-        .body("Logged out")
+    HttpResponse::Ok().body("Logged out")
 }
 
 #[get("/health")]

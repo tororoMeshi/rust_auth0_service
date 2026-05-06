@@ -8,8 +8,8 @@ use actix_web::http::header;
 
 use actix_session::storage::RedisSessionStore;
 use actix_session::{Session, SessionMiddleware};
-use actix_web::cookie::{Cookie, Key, SameSite};
-use actix_web::{get, web, App, HttpResponse, HttpServer};
+use actix_web::cookie::{time::Duration, Cookie, Key, SameSite};
+use actix_web::{get, post, web, App, HttpRequest, HttpResponse, HttpServer};
 use dotenv::dotenv;
 use log::{error, info};
 use oauth2::reqwest::async_http_client;
@@ -59,6 +59,10 @@ fn allowed_cors_origins() -> Vec<String> {
     }
 }
 
+fn post_login_redirect() -> String {
+    env::var("POST_LOGIN_REDIRECT").unwrap_or_else(|_| format!("{}/", app_base_url()))
+}
+
 fn cookie_domain() -> Option<String> {
     env::var("COOKIE_DOMAIN")
         .ok()
@@ -91,12 +95,27 @@ fn resolve_redirect_url(raw_redirect: &str) -> String {
         return raw_redirect.to_string();
     }
 
-    format!("{}/", base_url)
+    post_login_redirect()
 }
 
 fn build_auth_cookie(name: &'static str, value: String) -> Cookie<'static> {
     let mut builder = Cookie::build(name, value)
         .path("/")
+        .http_only(true)
+        .secure(true)
+        .same_site(SameSite::Strict);
+
+    if let Some(domain) = cookie_domain() {
+        builder = builder.domain(domain);
+    }
+
+    builder.finish()
+}
+
+fn build_expired_auth_cookie(name: &'static str) -> Cookie<'static> {
+    let mut builder = Cookie::build(name, "")
+        .path("/")
+        .max_age(Duration::seconds(0))
         .http_only(true)
         .secure(true)
         .same_site(SameSite::Strict);
@@ -204,8 +223,8 @@ async fn google_auth_callback(session: Session, query: web::Query<CallbackQuery>
                             // セッションに保存されたリダイレクト先を取得（デフォルトは "/"）
                             let raw_redirect: String = session
                                 .get("redirect")
-                                .unwrap_or(Some("/".to_string()))
-                                .unwrap_or("/".to_string());
+                                .unwrap_or_else(|_| Some(post_login_redirect()))
+                                .unwrap_or_else(post_login_redirect);
                             let redirect_url = resolve_redirect_url(&raw_redirect);
 
                             let session_cookie =
@@ -240,6 +259,20 @@ async fn google_auth_callback(session: Session, query: web::Query<CallbackQuery>
                 .body("Error exchanging code. Please retry the login process.")
         }
     }
+}
+
+#[post("/auth/logout")]
+async fn logout(req: HttpRequest) -> HttpResponse {
+    if let Some(cookie) = req.cookie("session_id") {
+        if let Err(e) = request_logout_from_uniauth(cookie.value()).await {
+            error!("Failed to delete session from uniauth: {:?}", e);
+        }
+    }
+
+    HttpResponse::Ok()
+        .cookie(build_expired_auth_cookie("session_id"))
+        .cookie(build_expired_auth_cookie("jwt"))
+        .body("Logged out")
 }
 
 async fn get_google_user_info(access_token: &str) -> Result<UserInfo, reqwest::Error> {
@@ -278,6 +311,23 @@ async fn request_session_from_uniauth(
     }
     let session_data = resp.json::<UniauthResponse>().await?;
     Ok(session_data)
+}
+
+async fn request_logout_from_uniauth(session_id: &str) -> Result<(), reqwest::Error> {
+    let uniauth_url = env::var("UNIAUTH_URL").unwrap_or_else(|_| "http://uniauth:8081".to_string());
+    let url = format!("{}/logout", uniauth_url);
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .header("Cookie", format!("session_id={}", session_id))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        error!("Uniauth logout returned error status: {}", resp.status());
+        return Err(resp.error_for_status().unwrap_err());
+    }
+
+    Ok(())
 }
 
 #[actix_web::main]
@@ -322,6 +372,7 @@ async fn main() -> std::io::Result<()> {
             ))
             .service(start_google_auth)
             .service(google_auth_callback)
+            .service(logout)
     })
     .bind("0.0.0.0:8080")?
     .run()
