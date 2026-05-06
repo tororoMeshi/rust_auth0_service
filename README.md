@@ -188,6 +188,32 @@ kubectl apply -k portal/k8s/
 ### Uniauth (`uniauth`)
 - `POST /upsert_and_token` - ユーザー登録・JWT発行・セッション作成
 - `POST /logout` - セッション削除
+- `POST /sessions/verify` - 内部向け session 検証。`session_id` と JWT `sub` 由来の `auth_user_id` を照合し、一致した場合のみ 200 を返す
+
+`POST /sessions/verify` のリクエスト/レスポンス仕様:
+
+```json
+// request
+{
+  "session_id": "session_id_cookie_value",
+  "auth_user_id": "42"
+}
+
+// response 200
+{
+  "active": true,
+  "user_id": 42,
+  "expires_at": 1735689600
+}
+```
+
+- `session_id` が Redis に存在しない場合は 401 を返す
+- `auth_user_id` が session の所有者と一致しない場合は 401 を返す
+- Redis 取得失敗や JSON 破損など、検証不能な場合は 500 を返す
+- tsuranari backend は JWT 検証後、JWT `sub` を `auth_user_id` としてこの API に渡す
+- tsuranari 側は `401` / `5xx` / 通信失敗をすべて認証失敗として扱い、fail closed にする
+- この API はクラスタ内部の tsuranari backend から uniauth へ問い合わせるための内部 API であり、外部公開しない
+- `session_id` はレスポンスに含めず、ログにも必要以上に出さない
 
 ## 開発・テスト
 
@@ -237,6 +263,7 @@ kubectl logs -n auth0 -l app=frontend
 - JWTシークレットはKubernetes Secretで管理
 - Cookieは `HttpOnly`, `Secure`, `SameSite=Strict` 設定
 - `POST /auth/logout` はブラウザ上の JWT Cookie と `session_id` Cookie を削除し、`uniauth` 側の Redis session も削除する
+- `POST /sessions/verify` は Redis 上の session 存在確認と `auth_user_id` 一致確認を行い、JWT 単体ではログイン扱いにしない設計のために使う
 - ただし、すでに流出した JWT は `exp` まで有効になり得る
 - JWT の完全な即時失効が必要な場合は、`jti` / `sid` / Redis denylist / session introspection などの追加設計が必要
 - PostgreSQL認証情報は Postgres Operator により自動管理

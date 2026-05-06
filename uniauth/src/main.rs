@@ -48,6 +48,12 @@ struct SessionData {
     expires_at: i64,
 }
 
+#[derive(Debug, Deserialize)]
+struct SessionVerifyRequest {
+    session_id: String,
+    auth_user_id: String,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct UserInfo {
     id: String,
@@ -80,6 +86,13 @@ struct SessionResponse {
     session_id: String,
     token: String,
     user: User,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionVerifyResponse {
+    active: bool,
+    user_id: i32,
+    expires_at: i64,
 }
 
 // ====== Handlers ======
@@ -179,6 +192,54 @@ async fn logout(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     HttpResponse::Ok().body("Logged out")
 }
 
+#[post("/sessions/verify")]
+async fn verify_session(
+    state: web::Data<AppState>,
+    payload: web::Json<SessionVerifyRequest>,
+) -> HttpResponse {
+    let session_id = payload.session_id.trim();
+    let auth_user_id = payload.auth_user_id.trim();
+
+    if session_id.is_empty() || auth_user_id.is_empty() {
+        return HttpResponse::Unauthorized().body("Invalid session");
+    }
+
+    let session_data = match load_session(&state.redis_client, session_id).await {
+        Ok(Some(session)) => session,
+        Ok(None) => return HttpResponse::Unauthorized().body("Invalid session"),
+        Err(e) => {
+            error!("Failed to load session from Redis: {}", e);
+            return HttpResponse::InternalServerError()
+                .body("Internal server error: Failed to verify session");
+        }
+    };
+
+    if session_data.expires_at <= Utc::now().timestamp() {
+        if let Err(e) = delete_session(&state.redis_client, session_id).await {
+            error!("Failed to delete expired session from Redis: {}", e);
+        }
+        return HttpResponse::Unauthorized().body("Invalid session");
+    }
+
+    let subject_user_id = match auth_user_id.parse::<i32>() {
+        Ok(id) => id,
+        Err(e) => {
+            error!("Invalid auth_user_id: {:?}", e);
+            return HttpResponse::Unauthorized().body("Invalid session");
+        }
+    };
+
+    if session_data.user_id != subject_user_id {
+        return HttpResponse::Unauthorized().body("Invalid session");
+    }
+
+    HttpResponse::Ok().json(SessionVerifyResponse {
+        active: true,
+        user_id: session_data.user_id,
+        expires_at: session_data.expires_at,
+    })
+}
+
 #[get("/health")]
 async fn health() -> impl Responder {
     HttpResponse::Ok().body("ok")
@@ -207,6 +268,39 @@ async fn upsert_user(pool: &Pool<Postgres>, user_info: &UserInfo) -> Result<User
     .await?;
 
     Ok(record)
+}
+
+async fn load_session(
+    redis_client: &redis::Client,
+    session_id: &str,
+) -> Result<Option<SessionData>, String> {
+    let mut conn = redis_client
+        .get_multiplexed_async_connection()
+        .await
+        .map_err(|e| format!("failed to get Redis connection: {e}"))?;
+
+    let raw_session: Option<String> = conn
+        .get(session_id)
+        .await
+        .map_err(|e| format!("failed to read session from Redis: {e}"))?;
+
+    match raw_session {
+        Some(raw) => serde_json::from_str::<SessionData>(&raw)
+            .map(Some)
+            .map_err(|e| format!("failed to deserialize session: {e}")),
+        None => Ok(None),
+    }
+}
+
+async fn delete_session(redis_client: &redis::Client, session_id: &str) -> Result<(), String> {
+    let mut conn = redis_client
+        .get_multiplexed_async_connection()
+        .await
+        .map_err(|e| format!("failed to get Redis connection: {e}"))?;
+
+    conn.del::<_, ()>(session_id)
+        .await
+        .map_err(|e| format!("failed to delete session from Redis: {e}"))
 }
 
 fn generate_jwt(
@@ -278,10 +372,31 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(pool.clone()))
             .app_data(web::Data::new(app_state.clone()))
             .service(upsert_and_token)
+            .service(verify_session)
             .service(logout)
             .service(health)
     })
     .bind("0.0.0.0:8081")?
     .run()
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_subject_can_be_parsed_as_user_id() {
+        let session = SessionData {
+            user_id: 42,
+            expires_at: 1_700_000_000,
+        };
+
+        assert_eq!("42".parse::<i32>(), Ok(session.user_id));
+    }
+
+    #[test]
+    fn session_subject_rejects_non_numeric_value() {
+        assert!("abc".parse::<i32>().is_err());
+    }
 }
