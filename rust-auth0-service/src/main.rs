@@ -19,7 +19,24 @@ use oauth2::{
 };
 use rand::{distributions::Alphanumeric, Rng};
 use serde::{Deserialize, Serialize};
-use std::env;
+use std::{env, io};
+
+#[derive(Clone)]
+struct AppConfig {
+    google_client_id: String,
+    google_client_secret: String,
+    google_redirect_uri: String,
+    uniauth_url: String,
+}
+
+fn required_env(name: &str) -> io::Result<String> {
+    env::var(name).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} environment variable is required"),
+        )
+    })
+}
 
 fn app_base_url() -> String {
     env::var("APP_BASE_URL")
@@ -135,7 +152,11 @@ struct StartAuthQuery {
 
 // Google OAuth 認証開始エンドポイント
 #[get("/auth/google")]
-async fn start_google_auth(session: Session, query: web::Query<StartAuthQuery>) -> HttpResponse {
+async fn start_google_auth(
+    session: Session,
+    query: web::Query<StartAuthQuery>,
+    config: web::Data<AppConfig>,
+) -> HttpResponse {
     // CSRF 対策用の state を生成しセッションに保存
     let state: String = rand::thread_rng()
         .sample_iter(&Alphanumeric)
@@ -158,11 +179,9 @@ async fn start_google_auth(session: Session, query: web::Query<StartAuthQuery>) 
     }
 
     // Google OAuth 認可 URL を生成
-    let client_id = env::var("GOOGLE_CLIENT_ID").expect("GOOGLE_CLIENT_ID not set");
-    let redirect_uri = env::var("GOOGLE_REDIRECT_URI").expect("GOOGLE_REDIRECT_URI not set");
     let auth_url = format!(
         "https://accounts.google.com/o/oauth2/auth?response_type=code&client_id={}&redirect_uri={}&scope=email%20profile&access_type=offline&prompt=consent&state={}",
-        client_id, redirect_uri, state
+        config.google_client_id, config.google_redirect_uri, state
     );
     info!("Redirecting to Google OAuth URL: {}", auth_url);
 
@@ -186,27 +205,59 @@ struct UserInfo {
 }
 
 #[get("/auth/google/callback")]
-async fn google_auth_callback(session: Session, query: web::Query<CallbackQuery>) -> HttpResponse {
+async fn google_auth_callback(
+    session: Session,
+    query: web::Query<CallbackQuery>,
+    config: web::Data<AppConfig>,
+) -> HttpResponse {
     // セッションに保存された state と受信した state の比較（CSRF 対策）
-    let stored_state: Option<String> = session.get("oauth_state").unwrap_or(None);
-    if stored_state.is_none() || stored_state.unwrap() != query.state {
+    let stored_state: Option<String> = match session.get("oauth_state") {
+        Ok(value) => value,
+        Err(e) => {
+            error!("Failed to get oauth_state: {:?}", e);
+            return HttpResponse::InternalServerError()
+                .body("Internal server error: cannot get oauth_state");
+        }
+    };
+    if stored_state.as_deref() != Some(query.state.as_str()) {
         error!("State parameter mismatch. Potential CSRF attack.");
         return HttpResponse::BadRequest()
             .body("Invalid state parameter. Please try logging in again.");
     }
 
     // Google からアクセストークンを取得
-    let client_id = env::var("GOOGLE_CLIENT_ID").expect("GOOGLE_CLIENT_ID not set");
-    let client_secret = env::var("GOOGLE_CLIENT_SECRET").expect("GOOGLE_CLIENT_SECRET not set");
-    let redirect_uri = env::var("GOOGLE_REDIRECT_URI").expect("GOOGLE_REDIRECT_URI not set");
+    let auth_url = match AuthUrl::new("https://accounts.google.com/o/oauth2/auth".to_string()) {
+        Ok(url) => url,
+        Err(e) => {
+            error!("Invalid Google auth URL: {:?}", e);
+            return HttpResponse::InternalServerError()
+                .body("Internal server error: invalid auth URL");
+        }
+    };
+    let token_url = match TokenUrl::new("https://oauth2.googleapis.com/token".to_string()) {
+        Ok(url) => url,
+        Err(e) => {
+            error!("Invalid Google token URL: {:?}", e);
+            return HttpResponse::InternalServerError()
+                .body("Internal server error: invalid token URL");
+        }
+    };
+    let redirect_uri = match RedirectUrl::new(config.google_redirect_uri.clone()) {
+        Ok(url) => url,
+        Err(e) => {
+            error!("Invalid Google redirect URI: {:?}", e);
+            return HttpResponse::InternalServerError()
+                .body("Internal server error: invalid redirect URI");
+        }
+    };
 
     let client = BasicClient::new(
-        ClientId::new(client_id),
-        Some(ClientSecret::new(client_secret)),
-        AuthUrl::new("https://accounts.google.com/o/oauth2/auth".to_string()).unwrap(),
-        Some(TokenUrl::new("https://oauth2.googleapis.com/token".to_string()).unwrap()),
+        ClientId::new(config.google_client_id.clone()),
+        Some(ClientSecret::new(config.google_client_secret.clone())),
+        auth_url,
+        Some(token_url),
     )
-    .set_redirect_uri(RedirectUrl::new(redirect_uri).unwrap());
+    .set_redirect_uri(redirect_uri);
 
     let token_result = client
         .exchange_code(AuthorizationCode::new(query.code.clone()))
@@ -218,7 +269,7 @@ async fn google_auth_callback(session: Session, query: web::Query<CallbackQuery>
             let access_token = token.access_token().secret().clone();
             match get_google_user_info(&access_token).await {
                 Ok(user_info) => {
-                    match request_session_from_uniauth(&user_info).await {
+                    match request_session_from_uniauth(&config.uniauth_url, &user_info).await {
                         Ok(session_data) => {
                             // セッションに保存されたリダイレクト先を取得（デフォルトは "/"）
                             let raw_redirect: String = session
@@ -262,9 +313,9 @@ async fn google_auth_callback(session: Session, query: web::Query<CallbackQuery>
 }
 
 #[post("/auth/logout")]
-async fn logout(req: HttpRequest) -> HttpResponse {
+async fn logout(req: HttpRequest, config: web::Data<AppConfig>) -> HttpResponse {
     if let Some(cookie) = req.cookie("session_id") {
-        if let Err(e) = request_logout_from_uniauth(cookie.value()).await {
+        if let Err(e) = request_logout_from_uniauth(&config.uniauth_url, cookie.value()).await {
             error!("Failed to delete session from uniauth: {:?}", e);
         }
     }
@@ -299,9 +350,9 @@ struct UniauthResponse {
 }
 
 async fn request_session_from_uniauth(
+    uniauth_url: &str,
     user_info: &UserInfo,
 ) -> Result<UniauthResponse, reqwest::Error> {
-    let uniauth_url = env::var("UNIAUTH_URL").unwrap_or_else(|_| "http://uniauth:8081".to_string());
     let url = format!("{}/upsert_and_token", uniauth_url);
     let client = reqwest::Client::new();
     let resp = client.post(&url).json(user_info).send().await?;
@@ -313,8 +364,10 @@ async fn request_session_from_uniauth(
     Ok(session_data)
 }
 
-async fn request_logout_from_uniauth(session_id: &str) -> Result<(), reqwest::Error> {
-    let uniauth_url = env::var("UNIAUTH_URL").unwrap_or_else(|_| "http://uniauth:8081".to_string());
+async fn request_logout_from_uniauth(
+    uniauth_url: &str,
+    session_id: &str,
+) -> Result<(), reqwest::Error> {
     let url = format!("{}/logout", uniauth_url);
     let client = reqwest::Client::new();
     let resp = client
@@ -339,15 +392,24 @@ async fn main() -> std::io::Result<()> {
     use actix_cors::Cors;
     use actix_web::http::header;
 
+    let config = AppConfig {
+        google_client_id: required_env("GOOGLE_CLIENT_ID")?,
+        google_client_secret: required_env("GOOGLE_CLIENT_SECRET")?,
+        google_redirect_uri: required_env("GOOGLE_REDIRECT_URI")?,
+        uniauth_url: env::var("UNIAUTH_URL").unwrap_or_else(|_| "http://uniauth:8081".to_string()),
+    };
+
     // RedisSessionStore の初期化
     let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://redis:6379".to_string());
-    let redis_store = RedisSessionStore::new(redis_url)
-        .await
-        .expect("Failed to create Redis session store");
+    let redis_store = RedisSessionStore::new(redis_url).await.map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            format!("failed to create Redis session store: {e}"),
+        )
+    })?;
 
     // セッション Cookie 署名用の秘密鍵
-    let secret_key = env::var("SESSION_SECRET_KEY")
-        .unwrap_or_else(|_| "0123456789abcdef0123456789abcdef".to_string());
+    let secret_key = required_env("SESSION_SECRET_KEY")?;
 
     HttpServer::new(move || {
         let mut cors = Cors::default()
@@ -365,6 +427,7 @@ async fn main() -> std::io::Result<()> {
 
         App::new()
             .wrap(cors)
+            .app_data(web::Data::new(config.clone()))
             .app_data(web::Data::new(redis_store.clone()))
             .wrap(SessionMiddleware::new(
                 redis_store.clone(),

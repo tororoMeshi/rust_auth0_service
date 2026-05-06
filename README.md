@@ -77,6 +77,8 @@ POST_LOGIN_REDIRECT=https://app.example.com/dashboard
 ALLOWED_REDIRECT_ORIGINS=https://app.example.com
 ALLOWED_CORS_ORIGINS=https://app.example.com,https://auth.example.com
 UNIAUTH_URL=http://uniauth:8081
+REDIS_URL=redis://redis:6379
+SESSION_SECRET_KEY=<セッションCookie署名用の32バイト以上のシークレット>
 COOKIE_DOMAIN=.example.com
 ```
 
