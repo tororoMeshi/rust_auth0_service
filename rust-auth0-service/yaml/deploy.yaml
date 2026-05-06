@@ -38,6 +38,8 @@ spec:
             value: "https://portal.tororomeshi.net"
           - name: ALLOWED_CORS_ORIGINS
             value: "https://portal.tororomeshi.net,https://auth.tororomeshi.net"
+          - name: COOKIE_DOMAIN
+            value: ".tororomeshi.net"
           - name: UNIAUTH_URL
             value: "http://uniauth:8081"
           - name: REDIS_URL

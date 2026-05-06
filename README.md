@@ -86,9 +86,11 @@ POSTGRES_USER=<PostgreSQLユーザー名>
 POSTGRES_PASSWORD=<PostgreSQLパスワード>
 DB_NAME=auth0_accounts
 REDIS_URL=redis://rfrm-redisfailover:6379
-COOKIE_DOMAIN=.tororomeshi.net
+APP_BASE_URL=https://app.example.com
+FRONTEND_ORIGIN=https://app.example.com
+COOKIE_DOMAIN=.example.com
 COOKIE_SECURE=true
-POST_LOGIN_REDIRECT=https://portal.tororomeshi.net/dashboard
+POST_LOGIN_REDIRECT=https://app.example.com/dashboard
 ```
 
 ### portal_backend

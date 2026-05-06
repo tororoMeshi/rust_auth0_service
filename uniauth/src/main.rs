@@ -16,6 +16,50 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Postgres};
 use std::env;
 
+fn app_base_url() -> String {
+    env::var("APP_BASE_URL")
+        .unwrap_or_else(|_| "http://localhost:8080".to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn cookie_domain() -> Option<String> {
+    env::var("COOKIE_DOMAIN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn cookie_secure() -> bool {
+    env::var("COOKIE_SECURE")
+        .map(|value| value == "true" || value == "1")
+        .unwrap_or(true)
+}
+
+fn post_login_redirect() -> String {
+    env::var("POST_LOGIN_REDIRECT").unwrap_or_else(|_| format!("{}/dashboard", app_base_url()))
+}
+
+fn frontend_origin() -> String {
+    env::var("FRONTEND_ORIGIN").unwrap_or_else(|_| app_base_url())
+}
+
+fn build_auth_cookie(name: &'static str, value: String, max_age: Duration) -> Cookie<'static> {
+    let mut builder = Cookie::build(name, value)
+        .path("/")
+        .max_age(max_age)
+        .http_only(true)
+        .same_site(SameSite::None);
+
+    if let Some(domain) = cookie_domain() {
+        builder = builder.domain(domain);
+    }
+
+    let mut cookie = builder.finish();
+    cookie.set_secure(cookie_secure());
+    cookie
+}
+
 #[derive(Clone)]
 struct AppState {
     redis_client: redis::Client,
@@ -71,14 +115,7 @@ async fn upsert_and_token(
 ) -> impl Responder {
     info!("Received /upsert_and_token request: {:?}", user_info);
 
-    let cookie_domain =
-        env::var("COOKIE_DOMAIN").unwrap_or_else(|_| ".tororomeshi.net".to_string());
-    let cookie_secure = env::var("COOKIE_SECURE")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(true);
     let response_mode = env::var("RESPONSE_MODE").unwrap_or_else(|_| "json".to_string()); // "json" or "redirect"
-    let post_login_redirect = env::var("POST_LOGIN_REDIRECT")
-        .unwrap_or_else(|_| "https://portal.tororomeshi.net/dashboard".to_string());
 
     // upsert
     let db_user = match upsert_user(&pool, &user_info).await {
@@ -139,28 +176,13 @@ async fn upsert_and_token(
     // Cookie 作成（SameSite=None + Secure、本番必須）
     let max_age = Duration::seconds(24 * 3600);
 
-    let mut jwt_cookie = Cookie::build("jwt", &token)
-        .domain(&cookie_domain)
-        .path("/")
-        .max_age(max_age)
-        .http_only(true)
-        .same_site(SameSite::None)
-        .finish();
-    jwt_cookie.set_secure(cookie_secure);
-
-    let mut sid_cookie = Cookie::build("session_id", session_id.clone())
-        .domain(&cookie_domain)
-        .path("/")
-        .max_age(max_age)
-        .http_only(true)
-        .same_site(SameSite::None)
-        .finish();
-    sid_cookie.set_secure(cookie_secure);
+    let jwt_cookie = build_auth_cookie("jwt", token.clone(), max_age);
+    let sid_cookie = build_auth_cookie("session_id", session_id.clone(), max_age);
 
     // 返し方を選択：JSON or 302 リダイレクト
     if response_mode == "redirect" {
         HttpResponse::Found()
-            .insert_header((header::LOCATION, post_login_redirect))
+            .insert_header((header::LOCATION, post_login_redirect()))
             .cookie(jwt_cookie)
             .cookie(sid_cookie)
             .finish()
@@ -193,30 +215,9 @@ async fn logout(req: HttpRequest, state: web::Data<AppState>) -> HttpResponse {
         }
     }
 
-    let cookie_domain =
-        env::var("COOKIE_DOMAIN").unwrap_or_else(|_| ".tororomeshi.net".to_string());
-    let cookie_secure = env::var("COOKIE_SECURE")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(true);
-
     // 有効期限 0 で無効化
-    let mut expired_session = Cookie::build("session_id", "")
-        .domain(&cookie_domain)
-        .path("/")
-        .max_age(Duration::seconds(0))
-        .http_only(true)
-        .same_site(SameSite::None)
-        .finish();
-    expired_session.set_secure(cookie_secure);
-
-    let mut expired_jwt = Cookie::build("jwt", "")
-        .domain(&cookie_domain)
-        .path("/")
-        .max_age(Duration::seconds(0))
-        .http_only(true)
-        .same_site(SameSite::None)
-        .finish();
-    expired_jwt.set_secure(cookie_secure);
+    let expired_session = build_auth_cookie("session_id", "".to_string(), Duration::seconds(0));
+    let expired_jwt = build_auth_cookie("jwt", "".to_string(), Duration::seconds(0));
 
     HttpResponse::Ok()
         .cookie(expired_session)
@@ -298,8 +299,7 @@ async fn main() -> std::io::Result<()> {
     let redis_client = redis::Client::open(redis_url).expect("Failed to create Redis client");
 
     let app_state = AppState { redis_client };
-    let frontend_origin = env::var("FRONTEND_ORIGIN")
-        .unwrap_or_else(|_| "https://portal.tororomeshi.net".to_string());
+    let frontend_origin = frontend_origin();
 
     HttpServer::new(move || {
         let cors = Cors::default()

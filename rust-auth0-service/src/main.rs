@@ -59,6 +59,13 @@ fn allowed_cors_origins() -> Vec<String> {
     }
 }
 
+fn cookie_domain() -> Option<String> {
+    env::var("COOKIE_DOMAIN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
 fn is_allowed_absolute_redirect(raw_redirect: &str, allowed_origin: &str) -> bool {
     if raw_redirect == allowed_origin {
         return true;
@@ -85,6 +92,20 @@ fn resolve_redirect_url(raw_redirect: &str) -> String {
     }
 
     format!("{}/", base_url)
+}
+
+fn build_auth_cookie(name: &'static str, value: String) -> Cookie<'static> {
+    let mut builder = Cookie::build(name, value)
+        .path("/")
+        .http_only(true)
+        .secure(true)
+        .same_site(SameSite::Strict);
+
+    if let Some(domain) = cookie_domain() {
+        builder = builder.domain(domain);
+    }
+
+    builder.finish()
 }
 
 // クエリパラメータ用構造体
@@ -187,24 +208,9 @@ async fn google_auth_callback(session: Session, query: web::Query<CallbackQuery>
                                 .unwrap_or("/".to_string());
                             let redirect_url = resolve_redirect_url(&raw_redirect);
 
-                            let cookie_domain = env::var("COOKIE_DOMAIN")
-                                .unwrap_or_else(|_| ".tororomeshi.net".to_string());
-
                             let session_cookie =
-                                Cookie::build("session_id", session_data.session_id.clone())
-                                    .path("/")
-                                    .domain(cookie_domain.clone())
-                                    .http_only(true)
-                                    .secure(true)
-                                    .same_site(SameSite::Strict)
-                                    .finish();
-                            let jwt_cookie = Cookie::build("jwt", session_data.token.clone())
-                                .path("/")
-                                .domain(cookie_domain)
-                                .http_only(true)
-                                .secure(true)
-                                .same_site(SameSite::Strict)
-                                .finish();
+                                build_auth_cookie("session_id", session_data.session_id.clone());
+                            let jwt_cookie = build_auth_cookie("jwt", session_data.token.clone());
 
                             info!("Redirecting user to: {}", redirect_url);
 

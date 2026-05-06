@@ -51,3 +51,13 @@ spec:
           # RedisにアクセスするためのURL
         - name: REDIS_URL
           value: "redis://rfrm-redisfailover:6379"
+        - name: APP_BASE_URL
+          value: "https://portal.tororomeshi.net"
+        - name: FRONTEND_ORIGIN
+          value: "https://portal.tororomeshi.net"
+        - name: COOKIE_DOMAIN
+          value: ".tororomeshi.net"
+        - name: COOKIE_SECURE
+          value: "true"
+        - name: POST_LOGIN_REDIRECT
+          value: "https://portal.tororomeshi.net/dashboard"
