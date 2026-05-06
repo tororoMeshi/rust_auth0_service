@@ -21,6 +21,72 @@ use rand::{distributions::Alphanumeric, Rng};
 use serde::{Deserialize, Serialize};
 use std::env;
 
+fn app_base_url() -> String {
+    env::var("APP_BASE_URL")
+        .unwrap_or_else(|_| "http://localhost:8080".to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn split_csv_env(name: &str) -> Vec<String> {
+    env::var(name)
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.trim_end_matches('/').to_string())
+        .collect()
+}
+
+fn allowed_redirect_origins() -> Vec<String> {
+    let mut origins = split_csv_env("ALLOWED_REDIRECT_ORIGINS");
+    let base_url = app_base_url();
+
+    if !origins.iter().any(|origin| origin == &base_url) {
+        origins.push(base_url);
+    }
+
+    origins
+}
+
+fn allowed_cors_origins() -> Vec<String> {
+    let origins = split_csv_env("ALLOWED_CORS_ORIGINS");
+
+    if origins.is_empty() {
+        allowed_redirect_origins()
+    } else {
+        origins
+    }
+}
+
+fn is_allowed_absolute_redirect(raw_redirect: &str, allowed_origin: &str) -> bool {
+    if raw_redirect == allowed_origin {
+        return true;
+    }
+
+    raw_redirect
+        .strip_prefix(allowed_origin)
+        .and_then(|rest| rest.chars().next())
+        .is_some_and(|next| matches!(next, '/' | '?' | '#'))
+}
+
+fn resolve_redirect_url(raw_redirect: &str) -> String {
+    let base_url = app_base_url();
+
+    if raw_redirect.starts_with('/') && !raw_redirect.starts_with("//") {
+        return format!("{}{}", base_url, raw_redirect);
+    }
+
+    if allowed_redirect_origins()
+        .iter()
+        .any(|origin| is_allowed_absolute_redirect(raw_redirect, origin))
+    {
+        return raw_redirect.to_string();
+    }
+
+    format!("{}/", base_url)
+}
+
 // クエリパラメータ用構造体
 #[derive(Debug, Deserialize)]
 struct StartAuthQuery {
@@ -119,13 +185,7 @@ async fn google_auth_callback(session: Session, query: web::Query<CallbackQuery>
                                 .get("redirect")
                                 .unwrap_or(Some("/".to_string()))
                                 .unwrap_or("/".to_string());
-                            let redirect_url = if raw_redirect.starts_with('/') {
-                                format!("https://portal.tororomeshi.net{}", raw_redirect)
-                            } else if raw_redirect.starts_with("https://portal.tororomeshi.net") {
-                                raw_redirect
-                            } else {
-                                "https://portal.tororomeshi.net/".to_string()
-                            };
+                            let redirect_url = resolve_redirect_url(&raw_redirect);
 
                             let cookie_domain = env::var("COOKIE_DOMAIN")
                                 .unwrap_or_else(|_| ".tororomeshi.net".to_string());
@@ -234,19 +294,21 @@ async fn main() -> std::io::Result<()> {
         .unwrap_or_else(|_| "0123456789abcdef0123456789abcdef".to_string());
 
     HttpServer::new(move || {
+        let mut cors = Cors::default()
+            .allowed_methods(vec!["GET", "POST", "OPTIONS"])
+            .allowed_headers(vec![
+                header::AUTHORIZATION,
+                header::ACCEPT,
+                header::CONTENT_TYPE,
+            ])
+            .supports_credentials();
+
+        for origin in allowed_cors_origins() {
+            cors = cors.allowed_origin(&origin);
+        }
+
         App::new()
-            .wrap(
-                Cors::default()
-                    .allowed_origin("https://portal.tororomeshi.net")
-                    .allowed_origin("https://auth.tororomeshi.net")
-                    .allowed_methods(vec!["GET", "POST", "OPTIONS"])
-                    .allowed_headers(vec![
-                        header::AUTHORIZATION,
-                        header::ACCEPT,
-                        header::CONTENT_TYPE,
-                    ])
-                    .supports_credentials(),
-            )
+            .wrap(cors)
             .app_data(web::Data::new(redis_store.clone()))
             .wrap(SessionMiddleware::new(
                 redis_store.clone(),

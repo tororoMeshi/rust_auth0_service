@@ -71,8 +71,12 @@ JWT_SECRET=<JWT署名用シークレット>
 ```bash
 GOOGLE_CLIENT_ID=<Google OAuth2クライアントID>
 GOOGLE_CLIENT_SECRET=<Google OAuth2クライアントシークレット>
+GOOGLE_REDIRECT_URI=https://auth.example.com/auth/google/callback
+APP_BASE_URL=https://app.example.com
+ALLOWED_REDIRECT_ORIGINS=https://app.example.com
+ALLOWED_CORS_ORIGINS=https://app.example.com,https://auth.example.com
 UNIAUTH_URL=http://uniauth:8081
-REDIRECT_URL=https://portal.tororomeshi.net/
+COOKIE_DOMAIN=.example.com
 ```
 
 ### uniauth

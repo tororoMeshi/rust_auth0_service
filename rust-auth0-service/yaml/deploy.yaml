@@ -32,6 +32,12 @@ spec:
                 key: client_secret
           - name: GOOGLE_REDIRECT_URI
             value: "https://auth.tororomeshi.net/auth/google/callback"
+          - name: APP_BASE_URL
+            value: "https://portal.tororomeshi.net"
+          - name: ALLOWED_REDIRECT_ORIGINS
+            value: "https://portal.tororomeshi.net"
+          - name: ALLOWED_CORS_ORIGINS
+            value: "https://portal.tororomeshi.net,https://auth.tororomeshi.net"
           - name: UNIAUTH_URL
             value: "http://uniauth:8081"
           - name: REDIS_URL
