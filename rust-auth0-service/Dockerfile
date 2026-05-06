@@ -1,5 +1,5 @@
 # ベースイメージ
-FROM rust:latest AS builder
+FROM rust:1.95.0-bookworm AS builder
 
 # 作業ディレクトリの設定
 WORKDIR /usr/src/app
