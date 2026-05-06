@@ -20,32 +20,43 @@ spec:
         ports:
         - containerPort: 8080
         env:
+          # google-auth-secrets / client_id
           - name: GOOGLE_CLIENT_ID
             valueFrom:
               secretKeyRef:
                 name: google-auth-secrets
                 key: client_id
+          # google-auth-secrets / client_secret
           - name: GOOGLE_CLIENT_SECRET
             valueFrom:
               secretKeyRef:
                 name: google-auth-secrets
                 key: client_secret
+          # 現在の本番値。流用時は差し替える
           - name: GOOGLE_REDIRECT_URI
             value: "https://auth.tororomeshi.net/auth/google/callback"
+          # 現在の本番値。流用時は差し替える
           - name: APP_BASE_URL
             value: "https://portal.tororomeshi.net"
+          # 現在の本番値。流用時は差し替える
           - name: POST_LOGIN_REDIRECT
             value: "https://portal.tororomeshi.net/dashboard"
+          # 現在の本番値。流用時は差し替える
           - name: ALLOWED_REDIRECT_ORIGINS
             value: "https://portal.tororomeshi.net"
+          # 現在の本番値。流用時は差し替える
           - name: ALLOWED_CORS_ORIGINS
             value: "https://portal.tororomeshi.net,https://auth.tororomeshi.net"
+          # 現在の本番値。流用時は差し替える
           - name: COOKIE_DOMAIN
             value: ".tororomeshi.net"
+          # uniauth service の内部 URL
           - name: UNIAUTH_URL
             value: "http://uniauth:8081"
+          # Redis session store
           - name: REDIS_URL
             value: "redis://rfrm-redisfailover:6379"
+          # session-secret / SESSION_SECRET_KEY
           - name: SESSION_SECRET_KEY
             valueFrom:
               secretKeyRef:

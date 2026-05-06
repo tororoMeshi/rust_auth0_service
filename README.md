@@ -93,6 +93,12 @@ APP_BASE_URL=https://app.example.com
 FRONTEND_ORIGIN=https://app.example.com
 ```
 
+### 置き換えが必要な値
+- `portal.tororomeshi.net` 系の値は現在の本番値です。別プロジェクトへ流用する時は `GOOGLE_REDIRECT_URI` / `APP_BASE_URL` / `POST_LOGIN_REDIRECT` / `ALLOWED_REDIRECT_ORIGINS` / `ALLOWED_CORS_ORIGINS` / `COOKIE_DOMAIN` / `FRONTEND_ORIGIN` をまとめて差し替えてください。
+- `SESSION_SECRET_KEY` は `rust-auth0-service` のセッション Cookie 署名鍵です。
+- `JWT_SECRET` は `uniauth` と `portal_backend` が参照する JWT 署名・検証鍵です。Secret 名は `uniauth-secrets`、data key は `jwt_secret` です。
+- `rust-auth0-service` が参照する Google OAuth の Secret 名は `google-auth-secrets`、data key は `client_id` と `client_secret` です。
+
 ### portal_backend
 ```bash
 PORT=3000
@@ -110,10 +116,38 @@ RUST_LOG=info
 - Cloudflare Tunnel設定
 
 ### 2. Secretsの作成
+`rust-auth0-service` は `google-auth-secrets` と `session-secret` を使い、`uniauth` は `uniauth-secrets` を使います。Secret 名と data key は deployment YAML と一致させてください。
+
+1. Google OAuth Secret を作成する
+   ```bash
+   ./rust-auth0-service/yaml/secret.sh client_secret.json
+   ```
+   生成される Secret:
+   - `google-auth-secrets`
+   - data key: `client_id`, `client_secret`
+
+2. `rust-auth0-service` のセッション署名用 Secret を作成する
+   ```bash
+   ./rust-auth0-service/yaml/create_session_secret.sh
+   ```
+   生成される Secret:
+   - `session-secret`
+   - data key: `SESSION_SECRET_KEY`
+
+3. `uniauth` と `portal_backend` が参照する JWT Secret を作成する
+   ```bash
+   ./uniauth/yaml/create_JWT_secret.sh
+   ```
+   生成される Secret:
+   - `uniauth-secrets`
+   - data key: `jwt_secret`
+
+   `JWT_SECRET` は環境変数名で、Secret の data key は `jwt_secret` です。
+
+手動で作る場合は次でも同じです。
 ```bash
 kubectl create secret generic uniauth-secrets -n auth0 \
-  --from-literal=JWT_SECRET="<共通JWTシークレット>" \
-  --from-literal=FAUNA_SECRET="<任意>"
+  --from-literal=jwt_secret="<共通JWTシークレット>"
 ```
 
 ### 3. サービスのデプロイ
@@ -196,9 +230,9 @@ kubectl logs -n auth0 -l app=frontend
    kubectl exec -n auth0 <pod-name> -- curl http://uniauth:8081/health
    ```
 
-3. JWT_SECRET一致確認:
+3. jwt_secret一致確認:
    ```bash
-   kubectl get secret -n auth0 uniauth-secrets -o jsonpath='{.data.JWT_SECRET}' | base64 -d | sha256sum
+   kubectl get secret -n auth0 uniauth-secrets -o jsonpath='{.data.jwt_secret}' | base64 -d | sha256sum
    ```
 
 ## セキュリティ考慮事項

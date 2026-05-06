@@ -41,7 +41,7 @@ spec:
         - name: DB_NAME
           value: auth0_accounts
 
-          # JWT 署名用の秘密鍵も Kubernetes Secret で管理するのが安全
+          # uniauth-secrets / jwt_secret を JWT_SECRET 環境変数として注入
         - name: JWT_SECRET
           valueFrom:
             secretKeyRef:
@@ -51,7 +51,9 @@ spec:
           # RedisにアクセスするためのURL
         - name: REDIS_URL
           value: "redis://rfrm-redisfailover:6379"
+          # 現在の本番値。流用時は差し替える
         - name: APP_BASE_URL
           value: "https://portal.tororomeshi.net"
+          # 現在の本番値。流用時は差し替える
         - name: FRONTEND_ORIGIN
           value: "https://portal.tororomeshi.net"

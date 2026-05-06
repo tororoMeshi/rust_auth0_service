@@ -5,7 +5,7 @@
 #
 # 1. Debian/Ubuntuベースで jq が無い場合、apt-get でインストールする
 # 2. client_secret.json から client_id, client_secret を取り出す
-# 3. kubectl create secret で Kubernetes Secret を作成・更新
+# 3. `google-auth-secrets` (data key: `client_id`, `client_secret`) を作成・更新する
 
 set -eu
 

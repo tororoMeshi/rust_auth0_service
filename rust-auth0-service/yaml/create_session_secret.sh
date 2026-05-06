@@ -3,7 +3,7 @@
 # Usage: ./create_session_secret.sh
 #
 # このスクリプトは、openssl を利用してランダムな SESSION_SECRET_KEY を生成し、
-# Kubernetes の Secret (namespace: auth0, secret名: session-secret) を作成・更新します.
+# Kubernetes の Secret (namespace: auth0, secret名: session-secret, data key: SESSION_SECRET_KEY) を作成・更新します.
 #
 # ※ SECRET_KEY はセッションの署名に使用されるため、十分な乱数（32バイト以上）を利用してください。
 #
@@ -30,12 +30,13 @@ echo "生成された SESSION_SECRET_KEY: $SESSION_SECRET_KEY"
 
 # --- 3. Secret 名と Namespace の設定 ---
 SECRET_NAME="session-secret"
+SECRET_KEY_NAME="SESSION_SECRET_KEY"
 NAMESPACE="auth0"
 
 # --- 4. Kubernetes Secret の作成または更新 ---
 kubectl create secret generic "$SECRET_NAME" \
   --namespace "$NAMESPACE" \
-  --from-literal=SESSION_SECRET_KEY="$SESSION_SECRET_KEY" \
+  --from-literal="$SECRET_KEY_NAME=$SESSION_SECRET_KEY" \
   --dry-run=client -o yaml | kubectl apply -f -
 
 echo "Kubernetes Secret '$SECRET_NAME' が Namespace '$NAMESPACE' に作成/更新されました。"

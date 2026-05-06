@@ -3,6 +3,7 @@ set -euo pipefail
 
 # ファイル名: create_uniauth_secret.sh
 # 用途: 同一 JWT シークレットを複数 Namespace に作成/更新
+# Secret 名は `uniauth-secrets`、data key は `jwt_secret`
 
 NAMESPACES=("auth0" "stateless-chat" "jamaica")
 SECRET_NAME="uniauth-secrets"
@@ -24,4 +25,3 @@ for NAMESPACE in "${NAMESPACES[@]}"; do
 done
 
 echo "✅Done. Remember to rollout restart the deployments that consume this secret."
-
