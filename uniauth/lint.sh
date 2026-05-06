@@ -2,13 +2,13 @@
 set -euo pipefail
 
 DOCKERHUB_USER="${DOCKERHUB_USER:?Set DOCKERHUB_USER environment variable. (例: DOCKERHUB_USER=yourname ./lint.sh)}"
-LINT_IMAGE=rust-lint-extended
+LINT_IMAGE=uniauth-rust-lint:local
 APP_IMAGE="${DOCKERHUB_USER:-tororomeshi}/uniauth"
 
 docker build -t "$LINT_IMAGE" - <<'DOCKERFILE'
-FROM rust:latest
+FROM rust:1.95.0-bookworm
 
-RUN rustup component add rustfmt clippy &&     apt-get update &&     apt-get install -y --no-install-recommends         pkg-config libssl-dev libwebp-dev         git curl &&     cargo install cargo-outdated &&     rm -rf /var/lib/apt/lists/*
+RUN rustup component add rustfmt clippy &&     apt-get update &&     apt-get install -y --no-install-recommends         pkg-config libssl-dev libwebp-dev         git curl &&     cargo install cargo-outdated --version 0.19.0 &&     rm -rf /var/lib/apt/lists/*
 DOCKERFILE
 
 docker run --rm   -v "$PWD":/usr/src/app   -w /usr/src/app   "$LINT_IMAGE" bash -c "
