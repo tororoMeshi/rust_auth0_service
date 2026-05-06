@@ -23,7 +23,7 @@ spec:
         fsGroup: 10001
       containers:
       - name: frontend
-        image: tororomeshi/portal-frontend:latest
+        image: tororomeshi/portal-frontend:20260506-3e7b618
         # Nginx が 80 で listen している想定。nginx.conf を 8080 にしているなら 8080 に変更。
         ports:
         - containerPort: 8080
