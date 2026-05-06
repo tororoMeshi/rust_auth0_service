@@ -1,12 +1,17 @@
 #!/bin/bash
 # This script builds a Docker image and pushes it to Docker Hub.
-# Usage: ./push_docker.sh [IMAGE_TAG]
+# Usage: ./push_docker.sh <IMAGE_TAG>
 # Make sure you are logged in to Docker Hub before running this script.
 
 set -eu
 
 IMAGE_NAME="tororomeshi/rust_auth0_service"
-IMAGE_TAG="${1:-0.1}"
+if [ $# -ne 1 ]; then
+  echo "Usage: $0 <IMAGE_TAG>" >&2
+  exit 1
+fi
+
+IMAGE_TAG="$1"
 
 # Check script directory
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -14,7 +19,7 @@ cd "${SCRIPT_DIR}"
 
 # Build image
 echo "Building Docker image..."
-if ! docker build -t "${IMAGE_NAME}:${IMAGE_TAG}" -t "${IMAGE_NAME}:latest" .; then
+if ! docker build -t "${IMAGE_NAME}:${IMAGE_TAG}" .; then
   echo "Docker build failed." >&2
   exit 1
 fi
@@ -30,10 +35,6 @@ push_image() {
   fi
 }
 
-# Push image with specific tag
 push_image "${IMAGE_TAG}"
-
-# Push image with latest tag
-push_image "latest"
 
 echo "Docker image pushed successfully."

@@ -15,8 +15,8 @@ spec:
     spec:
       containers:
       - name: rust-auth0-service
-        image: tororomeshi/rust_auth0_service:latest
-        imagePullPolicy: Always
+        image: tororomeshi/rust_auth0_service:0.3.3
+        imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 8080
         env:

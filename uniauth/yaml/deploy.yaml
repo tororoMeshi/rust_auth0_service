@@ -15,8 +15,8 @@ spec:
     spec:
       containers:
       - name: uniauth
-        image: tororomeshi/uniauth:latest
-        imagePullPolicy: Always
+        image: tororomeshi/uniauth:0.5.0
+        imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 8081
         env:
