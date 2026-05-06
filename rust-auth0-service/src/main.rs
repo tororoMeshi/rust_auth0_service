@@ -98,6 +98,29 @@ fn is_allowed_absolute_redirect(raw_redirect: &str, allowed_origin: &str) -> boo
         .is_some_and(|next| matches!(next, '/' | '?' | '#'))
 }
 
+fn is_allowed_post_login_redirect(raw_redirect: &str, allowed_origins: &[String]) -> bool {
+    if raw_redirect.starts_with('/') && !raw_redirect.starts_with("//") {
+        return true;
+    }
+
+    allowed_origins
+        .iter()
+        .any(|origin| is_allowed_absolute_redirect(raw_redirect, origin))
+}
+
+fn validate_post_login_redirect(raw_redirect: &str, allowed_origins: &[String]) -> io::Result<()> {
+    if is_allowed_post_login_redirect(raw_redirect, allowed_origins) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "POST_LOGIN_REDIRECT must match one of the allowed redirect origins or a relative path: {raw_redirect}"
+            ),
+        ))
+    }
+}
+
 fn resolve_redirect_url(raw_redirect: &str) -> String {
     let base_url = app_base_url();
 
@@ -399,6 +422,10 @@ async fn main() -> std::io::Result<()> {
         uniauth_url: env::var("UNIAUTH_URL").unwrap_or_else(|_| "http://uniauth:8081".to_string()),
     };
 
+    let allowed_redirect_origins = allowed_redirect_origins();
+    let post_login_redirect = post_login_redirect();
+    validate_post_login_redirect(&post_login_redirect, &allowed_redirect_origins)?;
+
     // RedisSessionStore の初期化
     let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://redis:6379".to_string());
     let redis_store = RedisSessionStore::new(redis_url).await.map_err(|e| {
@@ -440,4 +467,36 @@ async fn main() -> std::io::Result<()> {
     .bind("0.0.0.0:8080")?
     .run()
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn post_login_redirect_accepts_relative_path() {
+        let allowed = vec!["https://portal.example.com".to_string()];
+        assert!(is_allowed_post_login_redirect("/dashboard", &allowed));
+    }
+
+    #[test]
+    fn post_login_redirect_accepts_allowed_absolute_url() {
+        let allowed = vec!["https://portal.example.com".to_string()];
+        assert!(is_allowed_post_login_redirect(
+            "https://portal.example.com/dashboard",
+            &allowed
+        ));
+    }
+
+    #[test]
+    fn post_login_redirect_rejects_disallowed_absolute_url() {
+        let allowed = vec!["https://portal.example.com".to_string()];
+        assert!(!is_allowed_post_login_redirect(
+            "https://evil.example.com/dashboard",
+            &allowed
+        ));
+        assert!(
+            validate_post_login_redirect("https://evil.example.com/dashboard", &allowed).is_err()
+        );
+    }
 }
