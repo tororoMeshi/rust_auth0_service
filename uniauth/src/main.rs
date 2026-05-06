@@ -4,7 +4,7 @@ use actix_cors::Cors;
 use actix_web::{
     get, http::header, post, web, App, HttpRequest, HttpResponse, HttpServer, Responder,
 };
-use chrono::{Duration as ChronoDuration, NaiveDateTime, Utc};
+use chrono::{NaiveDateTime, Utc};
 use dotenv::dotenv;
 use jsonwebtoken::{encode, EncodingKey, Header};
 use log::{error, info};
@@ -13,7 +13,7 @@ use rand::{thread_rng, Rng};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Postgres};
-use std::env;
+use std::{env, io};
 
 fn app_base_url() -> String {
     env::var("APP_BASE_URL")
@@ -26,9 +26,19 @@ fn frontend_origin() -> String {
     env::var("FRONTEND_ORIGIN").unwrap_or_else(|_| app_base_url())
 }
 
+fn required_env(name: &str) -> io::Result<String> {
+    env::var(name).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} environment variable is required"),
+        )
+    })
+}
+
 #[derive(Clone)]
 struct AppState {
     redis_client: redis::Client,
+    jwt_secret: String,
 }
 
 // ====== Models ======
@@ -92,6 +102,7 @@ async fn upsert_and_token(
 
     // JWT
     let token = match generate_jwt(
+        &state.jwt_secret,
         db_user.id,
         &db_user.email,
         db_user.name.as_deref().unwrap_or(""),
@@ -124,12 +135,16 @@ async fn upsert_and_token(
                 .body("Internal server error: Redis connection failed");
         }
     };
+    let serialized_session = match serde_json::to_string(&session_data) {
+        Ok(value) => value,
+        Err(e) => {
+            error!("Failed to serialize session data: {:?}", e);
+            return HttpResponse::InternalServerError()
+                .body("Internal server error: Failed to serialize session");
+        }
+    };
     if let Err(e) = conn
-        .set_ex::<_, _, ()>(
-            &session_id,
-            serde_json::to_string(&session_data).unwrap(),
-            24 * 3600,
-        )
+        .set_ex::<_, _, ()>(&session_id, serialized_session, 24 * 3600)
         .await
     {
         error!("Failed to store session in Redis: {:?}", e);
@@ -195,16 +210,13 @@ async fn upsert_user(pool: &Pool<Postgres>, user_info: &UserInfo) -> Result<User
 }
 
 fn generate_jwt(
+    secret_key: &str,
     user_id: i32,
     email: &str,
     name: &str,
     picture: &str,
 ) -> Result<String, jsonwebtoken::errors::Error> {
-    let secret_key = env::var("JWT_SECRET").expect("JWT_SECRET must be set");
-    let expiration = Utc::now()
-        .checked_add_signed(ChronoDuration::hours(24))
-        .expect("valid timestamp")
-        .timestamp() as usize;
+    let expiration = (Utc::now().timestamp() + 24 * 3600) as usize;
     let claims = Claims {
         sub: user_id.to_string(),
         email: email.to_string(),
@@ -225,19 +237,33 @@ async fn main() -> std::io::Result<()> {
     dotenv().ok();
     env_logger::init();
 
-    let host = env::var("POSTGRES_HOST").expect("POSTGRES_HOST not set");
-    let user = env::var("POSTGRES_USER").expect("POSTGRES_USER not set");
-    let password = env::var("POSTGRES_PASSWORD").expect("POSTGRES_PASSWORD not set");
+    let host = required_env("POSTGRES_HOST")?;
+    let user = required_env("POSTGRES_USER")?;
+    let password = required_env("POSTGRES_PASSWORD")?;
+    let jwt_secret = required_env("JWT_SECRET")?;
     let db_name = env::var("DB_NAME").unwrap_or_else(|_| "auth0_accounts".to_string());
     let database_url = format!("postgres://{user}:{password}@{host}:5432/{db_name}");
     let pool = Pool::<Postgres>::connect(&database_url)
         .await
-        .expect("Failed to connect to Postgres");
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                format!("failed to connect to Postgres: {e}"),
+            )
+        })?;
 
     let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://redis:6379".to_string());
-    let redis_client = redis::Client::open(redis_url).expect("Failed to create Redis client");
+    let redis_client = redis::Client::open(redis_url).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("failed to create Redis client: {e}"),
+        )
+    })?;
 
-    let app_state = AppState { redis_client };
+    let app_state = AppState {
+        redis_client,
+        jwt_secret,
+    };
     let frontend_origin = frontend_origin();
 
     HttpServer::new(move || {
