@@ -162,6 +162,8 @@ kubectl apply -k portal/k8s/
 
 ## 認証フロー
 
+以下の `portal.tororomeshi.net` / `auth.tororomeshi.net` は現在の本番例です。別プロジェクトへ流用する時は、対応するホスト名と URL をまとめて置き換えてください。
+
 1. ユーザーが `https://portal.tororomeshi.net/` にアクセス
 2. 「Login with Google」クリック
 3. `auth.tororomeshi.net/auth/google` にリダイレクト
@@ -181,7 +183,7 @@ kubectl apply -k portal/k8s/
 ### Auth Service (`rust-auth0-service`)
 - `GET /auth/google` - Google OAuth2認証開始
 - `GET /auth/google/callback` - OAuth2コールバック
-- `POST /auth/logout` - Cookie失効とセッション削除
+- `POST /auth/logout` - ブラウザ上の JWT Cookie を削除し、`uniauth` 側の Redis session も削除する
 
 ### Uniauth (`uniauth`)
 - `POST /upsert_and_token` - ユーザー登録・JWT発行・セッション作成
@@ -233,7 +235,10 @@ kubectl logs -n auth0 -l app=frontend
 ## セキュリティ考慮事項
 
 - JWTシークレットはKubernetes Secretで管理
-- Cookieは `HttpOnly`, `Secure`, `SameSite=None` 設定
+- Cookieは `HttpOnly`, `Secure`, `SameSite=Strict` 設定
+- `POST /auth/logout` はブラウザ上の JWT Cookie と `session_id` Cookie を削除し、`uniauth` 側の Redis session も削除する
+- ただし、すでに流出した JWT は `exp` まで有効になり得る
+- JWT の完全な即時失効が必要な場合は、`jti` / `sid` / Redis denylist / session introspection などの追加設計が必要
 - PostgreSQL認証情報は Postgres Operator により自動管理
 - すべての通信はHTTPS（Cloudflare Tunnel経由）
 
