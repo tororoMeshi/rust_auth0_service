@@ -49,13 +49,8 @@ OAuth2認証とJWT管理を提供するRust製マイクロサービス群です�
 
 ## テスト・開発用コンポーネント
 
-### 旧実装（参考用・削除済み）
-- **~~portal-backend/~~** - Express.js版バックエンド（削除済み）
-- **uniauth/src/ok_main.rs** - 旧バージョン実装（参考用）
-- **rust-auth0-service/src/ver2_auth_main.rs** - 旧認証フロー（参考用）
-
 ### 開発支援ファイル
-- **portal/lint.sh**, **uniauth/lint.sh** - コードリンター
+- **portal/lint.sh** - コードリンター
 - **portal/.eslintrc.\*** - ESLint設定
 - **portal/Dockerfile.nginx** - 代替Dockerファイル
 - **portal/scripts/** - デプロイスクリプト
@@ -241,38 +236,6 @@ kubectl logs -n auth0 -l app=frontend
 - Cookieは `HttpOnly`, `Secure`, `SameSite=None` 設定
 - PostgreSQL認証情報は Postgres Operator により自動管理
 - すべての通信はHTTPS（Cloudflare Tunnel経由）
-
-## 旧Cloudflare設定（参考）
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  namespace: cloudflare
-  name: cloudflared
-  labels:
-    app: cloudflared
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: cloudflared
-  template:
-    metadata:
-      labels:
-        app: cloudflared
-    spec:
-      containers:
-      - name: cloudflared
-        image: cloudflare/cloudflared:latest
-        command: ["cloudflared", "tunnel", "--no-autoupdate", "run"]
-        env:
-        - name: TUNNEL_TOKEN
-          valueFrom:
-            secretKeyRef:
-              name: cloudflared-token
-              key: token
-```
 
 ## ライセンス
 
