@@ -1,6 +1,10 @@
 // src/main.rs for rust-auth0-service
 
 // 必要なクレートのインポート
+// T02で定義し、後続の認証タスクから順次接続する。
+#[allow(dead_code)]
+mod auth_foundation;
+
 #[allow(unused_imports)]
 use actix_cors::Cors;
 #[allow(unused_imports)]
