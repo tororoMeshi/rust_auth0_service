@@ -22,7 +22,7 @@ Browser
 
 本番の正規公開hostは `auth.tororomeshi.net` と `portal.tororomeshi.net` の二つだけとする。portalの現在のIngressは `portal.tororomeshi.net` の `/` をfrontendへ送っている。`portal` の既存画面ルートは `/` と `/dashboard` であり、認証用の `/login`、`/auth/callback`、`/logout`、`/api/*` と衝突しないため、これらを `portal_backend` に振り分ける。`app.tororomeshi.net` は本番の正規オリジンとして残さず、旧hostとして移行対象にする。
 
-初期登録Webサービスはportalとportal_backendを合わせた単一サービスである。本番の登録値は `service_id = portal-prod`、`login_callback_uri = https://portal.tororomeshi.net/auth/callback`、`logout_return_uri = https://portal.tororomeshi.net/` とする。開発環境は `service_id = portal-dev` を別登録する。現在のVite設定は開発serverのポートを `8080` に固定し、`/login`、`/auth/callback`、`/logout`、`/api/*` を `http://localhost:3000` のportal_backendへproxyする。そのため `login_callback_uri = http://localhost:8080/auth/callback`、`logout_return_uri = http://localhost:8080/` とする。ブラウザが実際にアクセスするViteオリジンは `http://localhost:8080` であり、開発環境でも `/` を含むこれらの経路はブラウザから見て単一の同一オリジンである。
+初期登録Webサービスはportalとportal_backendを合わせた単一サービスである。本番の登録値は `service_id = portal-prod`、`login_callback_uri = https://portal.tororomeshi.net/auth/callback`、`logout_return_uri = https://portal.tororomeshi.net/` とする。開発環境は `service_id = portal-dev` を別登録する。現在はVite port 5173で、proxyは `/api` のみである。目標構成では、開発環境でViteのポート5173を維持し、T17で `/login`、`/auth/callback`、`/logout`、`/api/*` を `http://localhost:3000` のportal_backendへproxyする。そのため登録値は `login_callback_uri = http://localhost:5173/auth/callback`、`logout_return_uri = http://localhost:5173/` とし、ブラウザが実際にアクセスするViteオリジンは `http://localhost:5173` である。
 
 ## 2. コンポーネントと責務
 
@@ -40,7 +40,7 @@ Browser
 
 portalのIngressまたは同等のルーティングは、`/` をportalへ、`/login`、`/auth/callback`、`/logout`、`/api/*` をportal_backendへ送る。`/auth/callback` は認証基盤のcallbackではなく、portalの登録済みWebサービスcallbackである。認証基盤のGoogle callbackは `auth.tororomeshi.net` 側にだけ置く。portalとportal_backendが同一オリジンなので、認証のためのCORS構成は不要である。
 
-portal_backendはhandoff交換で接続タイムアウトとリクエスト全体のタイムアウトを設定する。いずれも有限値とし、具体値は実装設計で決める。HTTPレスポンスを正常に受信できなかった場合は、交換が成功したか未成立かを推測しない。同じhandoff codeを自動再試行しない。同じLoginStartを再利用せず、portalローカルセッションを作成せず、利用者には新しいログイン開始を要求する。これは、認証基盤がhandoffを使用済みにした後でレスポンスが失われる可能性があるためである。
+portal_backendのhandoff交換接続タイムアウトは3秒、handoff交換全体タイムアウトは10秒とする。HTTPレスポンスを正常に受信できなかった場合は、交換が成功したか未成立かを推測しない。同じhandoff codeを自動再試行しない。同じLoginStartを再利用せず、portalローカルセッションを作成せず、利用者には新しいログイン開始を要求する。これは、認証基盤がhandoffを使用済みにした後でレスポンスが失われる可能性があるためである。
 
 ## 4. Cookieとローカル状態
 
@@ -48,7 +48,9 @@ portal_backendはhandoff交換で接続タイムアウトとリクエスト全�
 
 portalのローカルセッションCookieは `portal.tororomeshi.net` にだけ属するhost-only Cookieとする。`Domain` は設定せず、`Path=/`、`Secure`、`HttpOnly`、`SameSite=Lax` とし、値はportalローカルセッション参照だけとする。認証基盤Cookieとportal Cookieは名前も値も共有しない。
 
-portal_backendには所有可能な既存の安全な永続ストアは確認できない。したがって初期実装は `replicas = 1`、`Deployment strategy = Recreate` に固定し、LoginStartとLocalSessionを期限付きプロセスメモリに保存する。両方は作成時に絶対有効期限を持ち、取得時に期限を検査する。期限切れ状態は成功に使用せず、その場で削除し、一つの粗い定期掃除処理で期限切れ状態を削除する。LoginStartとLocalSessionにはそれぞれ保持件数の上限を持たせる。上限到達時は有効な既存状態を追い出さず、新しい状態の作成を拒否し、未認証やデータ不在として扱わない一時的な処理失敗とする。正確な件数上限と掃除間隔は実装設計で決める。
+portalのローカルログアウトCSRF Cookieは `__Host-portal_csrf` とし、`Path=/`、`Secure`、`SameSite=Lax`、Domainなし、HttpOnlyなしとする。LocalSession作成時はOS乱数32バイトから43文字のBase64url値を生成し、LocalSessionにはそのSHA-256 lookupだけを保存して平文を `__Host-portal_csrf` に設定する。LocalSession CookieはHttpOnlyを維持する。`POST /logout` ではJavaScriptがCSRF Cookieを読み `X-CSRF-Token` に設定し、LocalSession Cookieから状態を取得する。`__Host-portal_csrf` Cookieの平文値、`X-CSRF-Token` headerの平文値、LocalSessionに保存したSHA-256 lookupを照合する。Cookie値とheader値を定数時間比較し、一致した値をSHA-256化してLocalSession内hashと定数時間比較し、両方一致した場合だけLocalSessionと両Cookieを削除する。不一致・欠落・期限切れは403で状態を変更しない。
+
+portal_backendには所有可能な既存の安全な永続ストアは確認できない。したがって初期実装は `replicas = 1`、`Deployment strategy = Recreate` に固定し、LoginStartとLocalSessionを期限付きプロセスメモリに保存する。両方は作成時に絶対有効期限を持ち、取得時に期限を検査する。期限切れ状態は成功に使用せず、その場で削除し、定期掃除間隔 = 60秒で期限切れ状態を削除する。LoginStart保持件数上限 = 10,000件、LocalSession保持件数上限 = 50,000件とする。上限到達時は有効な既存状態を追い出さず、新しい状態の作成を拒否し、未認証やデータ不在として扱わない一時的な処理失敗とする。
 
 Recreateを選ぶ理由は、LoginStartとLocalSessionをプロセスメモリに持ち、RollingUpdateでは新旧Podが一時的に同時稼働する可能性があり、新旧Pod間でメモリ状態を共有できないためである。Serviceから異なるPodへ振り分けられると認証状態が不安定になる。sticky sessionや共有セッションストアは導入せず、更新時に既存LoginStartとLocalSessionがすべて失効することを許容する。portal_backend再起動時も途中callbackを失敗させ、portal利用者には再ログインを要求する。認証基盤の共通セッションは維持されるため、再ログイン時にGoogle認証を省略できる場合がある。
 
@@ -58,7 +60,7 @@ PostgreSQLとRedisへ接続できるアプリケーションは `rust-auth0-serv
 
 既存のportal_backend NetworkPolicyは存在するため、初期実装ではその最小方針を維持する。標準的なKubernetes NetworkPolicyではFQDNを直接宛先指定できるとは限らない。切替前に、portal_backendからcluster DNSへ名前解決できること、公開IngressのTCP 443へ接続できること、`auth.tororomeshi.net`を名前解決できること、TLS証明書とSNIの検証に成功すること、`POST /auth/handoffs/exchange`へ到達できること、現在のNetworkPolicyが必要なDNS通信とHTTPS通信を遮断しないことを検証する。NetworkPolicyの具体的な宛先は、現在のCNI、Ingressアドレス、既存Policyを確認して決める。PostgreSQLとRedisはIngressへ公開せず、認証基盤からだけ到達可能にする。認証基盤用NetworkPolicyが現在ないことを理由に、新設を初期実装の必須要素にはしない。
 
-rust-auth0-serviceのSecretはGoogle client secret、PostgreSQL接続情報、Redis接続情報である。Google client IDは現在の管理方式を維持してよい。認証基盤は `service_secret` の平文をSecretに置かず、PostgreSQLのSHA-256検証値だけを持つ。portal_backendのSecretは `service_secret` だけである。Cookie名、TTL、公開URL、`service_id` は通常設定とする。`JWT_SECRET`、`ALLOWED_REDIRECT_ORIGINS`、`POST_LOGIN_REDIRECT`、uniauth接続先URL、uniauth専用Secret、親ドメインCookie設定、frontendへ注入された認証用Secretは削除対象である。
+認証基盤はportal固有の `service_id` を環境変数に持たず、要求から受け取った `service_id` をPostgreSQLで検証する。認証基盤が保存する `service_secret` はPostgreSQLのSHA-256検証値だけであり、portal_backendは平文 `service_secret` をSecretから受け取る。Cookie名、Cookie属性、TTL、入力上限、CSRF方式、service_id形式は実装定数文書に従うコード定数とする。公開URL、Google callback URI、PostgreSQL接続先、Redis接続先、portal_backend自身の`service_id`、認証基盤URLは通常設定とする。portal_backendの `service_secret`、Google client secret、PostgreSQL credential、Redis credentialが存在する場合はSecretとする。`JWT_SECRET`、`ALLOWED_REDIRECT_ORIGINS`、`POST_LOGIN_REDIRECT`、uniauth接続先URL、uniauth専用Secret、親ドメインCookie設定、frontendへ注入された認証用Secretは削除対象である。
 
 ## 6. 配備・再起動・障害
 
@@ -70,7 +72,7 @@ portal_backend再起動時は、メモリ上のLoginStartとLocalSessionが消�
 
 ## 7. 現在実装との差分
 
-現在のHEADは想定基準コミット `31fae58 docs: define authentication foundation design` と一致している。現在の作業ツリーにはリポジトリ変更を加えない。
+現在のHEADは想定基準コミット `ea160810824ade97709ee66cc5c89183f80e1f0d`（`ea16081 docs: define authentication implementation tasks`）と一致している。T01は稼働PodのimageIDからdigestを取得し、ロールバック参照として固定済みとする。T21/T25はdigest指定でレジストリからpullし、旧構成を再配備できることを実証する。現在の作業ツリーにはリポジトリ変更を加えない。
 
 | 現在 | 目標 | 物理的な変更 |
 |---|---|---|

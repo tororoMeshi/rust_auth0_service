@@ -6,7 +6,7 @@
 
 認証基盤は `rust-auth0-service` の単一プロセスへ集約する。Google接続と認証コアは同一サービス内の論理モジュールにとどめる。汎用暗号フレームワーク、providerプラグイン、ORM、汎用repository、汎用セッションライブラリ、新規インフラ製品、互換経路、二重書込み、fallback、feature flagは導入しない。
 
-確認時のHEADは想定どおり `8708f1eace45e60163124cfaded384ccf11b4899`（`8708f1e docs: define authentication component architecture`）である。作業ツリーには未追跡の `docs/auth-current-state.md`、`docs/auth-foundation-design-condensed.md:Zone.Identifier`、`docs/back/` があり、本計画では変更しない。
+確認時のHEADは想定どおり `ea160810824ade97709ee66cc5c89183f80e1f0d`（`ea16081 docs: define authentication implementation tasks`）である。作業ツリーには未追跡の `docs/auth-current-state.md`、`docs/auth-foundation-design-condensed.md:Zone.Identifier`、`docs/back/` があり、本計画では変更しない。
 
 ## 2. 現在実装の変更範囲
 
@@ -39,7 +39,7 @@ Gate D → T21 → T22 → T23 → T24 → T25 → Gate E → T26
 
 - T01で現行の起動・検証・配置・正規URI・実スキーマを入力値として固定している。
 - T01の実装定数表が承認済みである。
-- 旧構成のイメージdigest、Gitコミット、マニフェストおよび設定参照がT01で固定されている。
+- 旧構成のイメージdigest、Kubernetesリソース、マニフェスト所在および設定参照がT01で固定されている。
 - PostgreSQLの3テーブルと既存 `internal_user_id` 維持方針がmigrationとして検証可能である。
 - サービス認証と本人解決がDB障害時に成功へ進まない。
 - Redisキー種類が4個だけで、Hash、TTL、`expires_at`、使用済みhandoff保持を満たす。
@@ -65,7 +65,7 @@ Gate D → T21 → T22 → T23 → T24 → T25 → Gate E → T26
 - `rust-auth0-service` は1 replica、`portal_backend` は1 replicaかつ `Recreate` である。
 - uniauth、JWT、旧API、親ドメインCookie、旧Redis JSONセッション、不要依存が残っていない。
 - PostgreSQLとRedisはIngressへ公開されていない。
-- 旧構成を削除したリポジトリ状態でも、T01で固定した旧Gitコミットとイメージdigestを参照できる。
+- 旧構成を削除したリポジトリ状態でも、T01で固定した不変image digest、Kubernetes構成、旧マニフェストの所在を参照できる。
 
 ### Gate E: 一括移行可能
 
@@ -92,13 +92,6 @@ Gate D → T21 → T22 → T23 → T24 → T25 → Gate E → T26
 - `docs/auth-current-state.md`
 - `docs/auth-foundation-implementation-values.md`（新規）
 - `docs/auth-foundation-rollback-baseline.md`（新規）
-- `rust-auth0-service/Cargo.toml`
-- `uniauth/Cargo.toml`
-- `portal_backend/Cargo.toml`
-- `portal/package.json`
-- `portal/vite.config.js`
-- `postgres/postgres-init-sql.yaml`
-- `redis/create_redis.yaml`
 
 **実施内容**
 
@@ -107,7 +100,7 @@ Gate D → T21 → T22 → T23 → T24 → T25 → Gate E → T26
 - Google callback URI、本番・開発の正規URI、既存Secretと設定の配置を固定する。
 - migration、Lua、移行手順、テストの配置先を現行管理方式から確定する。
 - `docs/auth-foundation-rollback-baseline.md`へ、現在本番で稼働中の旧rust-auth0-service、旧uniauth、旧portal_backend、旧portalについて、コンテナイメージのrepository、tag、digestを記録する。可変tagだけでなくdigestを取得する。
-- 同文書へ、現在適用されているDeployment、Service、Ingress、ConfigMap、Secret参照、NetworkPolicyの構成、旧構成を生成したGitコミット、旧構成のbuildとdeployに必要な手順・成果物の所在を事実として記録する。Secretの平文値は記録せず、Secret名、key名、参照先だけを記録する。
+- 同文書へ、現在適用されているDeployment、Service、Ingress、ConfigMap、Secret参照、NetworkPolicyの構成、image tag、Git履歴、Deployment annotation、CI/CD記録から生成Gitコミットを調査し、確認できた候補と根拠を記録する。確定できない場合は追跡性の未確認事項として残す。旧構成のbuildとdeployに必要な手順・成果物の所在を事実として記録する。Secretの平文値は記録せず、Secret名、key名、参照先だけを記録する。
 - イメージdigestまたは旧構成の取得に失敗した場合は、後続実装を開始しない。ロールバック手順そのものや新しいJWT_SECRETはT21で作成する。
 - `docs/auth-foundation-implementation-values.md`へ、正本で決定済みの外部認証トランザクションTTL、共通認証セッションTTL、handoff TTL、共通ログアウト状態TTLを転記する。
 - 同文書へ、LoginStart TTL、LocalSession TTL、LoginStart・LocalSession保持件数上限、メモリ掃除間隔、handoff交換の接続・全体タイムアウト、認証基盤・portalローカルセッション・ブラウザコンテキスト用一時Cookie名、共通・ローカルログアウトのCSRF方式、各HTTP入力の最大長、HTTPリクエストボディ最大サイズ、旧Cookie削除に必要なCookie名とDomainを固定する。
@@ -124,7 +117,7 @@ Gate D → T21 → T22 → T23 → T24 → T25 → Gate E → T26
 - T02以降で新しい認証設計判断を行う必要がない。
 - Cookie名、TTL、上限、掃除間隔、タイムアウト、CSRF方式が確定している。
 - 旧構成4コンポーネントの不変なイメージdigestが記録済みである。
-- 切替前構成を復元するGitコミットとマニフェストの所在が記録済みである。
+- 旧構成の稼働image digest、Kubernetes構成、マニフェスト所在が記録済みである。正確な生成Gitコミットの未特定だけではT01を未完了にしない。
 - Secretの平文を記録していない。
 - ロールバック元情報をT20の削除後に初めて探す必要がない。
 
@@ -349,7 +342,7 @@ Gate Aを通過している。
 
 **実施内容**
 
-- Google、PostgreSQL、Redis、公開URL、Cookie、TTLに必要な設定を整理する。`service_id`はブラウザまたはHTTP Basic要求から受け取り、PostgreSQLの`registered_web_services`で検証し、認証基盤の環境変数へportal固有値を持たせない。
+- Google、PostgreSQL、Redis、公開URLに必要な通常設定とSecretを整理する。Cookie名、Cookie属性、TTL、入力上限、CSRF方式は実装定数文書に従うコード定数として扱う。`service_id`はブラウザまたはHTTP Basic要求から受け取り、PostgreSQLの`registered_web_services`で検証し、認証基盤の環境変数へportal固有値を持たせない。
 - `UNIAUTH_URL`、任意redirect、親ドメインCookie、JWTに関する設定を認証基盤から除く準備を行う。
 - Secret、コード、Cookie値のログマスキングを共通化する。
 
@@ -467,7 +460,7 @@ Gate Bを通過している。
 
 - `service_secret`、service ID、認証基盤URL、ローカルCookie設定を整理する。
 - LoginStartモデル、ブラウザコンテキスト参照、PKCE verifier、安全な相対post-login path、絶対期限を実装する。
-- LocalSessionモデル、保持件数上限、取得時削除、単一定期掃除を実装する。
+- LocalSessionモデル、保持件数上限、取得時削除、単一定期掃除を実装する。LocalSession作成時にCSRF値を生成し、SHA-256 lookupだけをLocalSessionへ保存して、平文を`__Host-portal_csrf`へ設定する。
 - 上限到達時は既存状態を追い出さず、新規作成を一時失敗として拒否する。
 
 **検証**
@@ -524,7 +517,7 @@ T14が完了している。
 **実施内容**
 
 - 保護APIをhost-only LocalSession Cookieで認可し、最小の`internal_user_id`と認証状態だけを返す。
-- `POST /logout`でT01で固定したCSRF方式を検証してからローカル状態を削除し、Cookieを失効する。GETによるローカルログアウトは作らず、CSRF不一致ではLocalSessionを削除せず、Cookieの存在だけをCSRF対策にしない。
+- `POST /logout`では、`__Host-portal_csrf` Cookieの平文値、`X-CSRF-Token` headerの平文値、LocalSessionに保存したSHA-256 lookupを照合する。Cookie値とheader値を定数時間比較し、一致値をSHA-256化し、LocalSession内hashと定数時間比較し、両方一致時だけLocalSessionと両Cookieを削除する。GETによるローカルログアウトは作らず、不一致・欠落・期限切れは403で状態を変更しない。
 - JWT解釈、CORS認証依存、旧Cookieの受理を削除する。
 
 **検証**
@@ -582,12 +575,12 @@ T16が完了している。
 
 **実施内容**
 
-- Viteの8080番ポートを維持し、`/login`、`/auth/callback`、`/logout`、`/api/*`をportal_backendへproxyする。
+- Viteの5173番ポートを維持し、`/login`、`/auth/callback`、`/logout`、`/api/*`をportal_backendへproxyする。
 - T01で固定した開発callback URIとlogout URIに一致させる。
 
 **検証**
 
-- ブラウザから見たlocalhost:8080の経路とbackend到達先を確認する。
+- ブラウザから見た `http://localhost:5173` の経路とbackend到達先を確認する。
 
 **完了条件**
 
@@ -682,7 +675,7 @@ T16–T19が完了している。
 - コメントアウト、feature flag、互換API、fallbackとして残さない。
 - 新しい一括切替リリース内で旧経路が存在しない状態をリポジトリ上で作り、統合検証とリハーサルを行う。現在稼働中の旧本番環境はT26まで変更しない。
 - T18、T19、T20の成果物を個別に本番へ順次適用せず、本番への新マニフェスト適用、uniauth停止、旧API停止はT26の一括切替で同時に行う。
-- T01でロールバック元情報が固定されていなければ、旧コードや旧マニフェストを削除しない。T20でリポジトリから旧構成を削除しても、T01に記録したGitコミットと不変イメージdigestから旧構成を復元できる状態を維持する。
+- T01でロールバック元情報が固定されていなければ、旧コードや旧マニフェストを削除しない。T20でリポジトリから旧構成を削除しても、T01に記録した不変image digest、Kubernetes構成、旧マニフェストの所在、設定・Secret参照から旧構成を復元するための基準を維持する。
 
 **検証**
 
@@ -712,7 +705,7 @@ Gate Dを通過し、T04で管理場所を確定している。
 
 - 現行users事前検査、usersから`internal_users`への変換、usersから`external_identities`への変換、件数・ID・外部ID検査、identity sequence調整、旧users削除を、一括切替専用のSQLまたは手順として作成する。
 - `registered_web_services`初期登録、service_secret生成、旧Redisキー安全識別・削除、PostgreSQLバックアップ・復元確認、旧Cookie失効、ロールバック用の新しいJWT_SECRET生成の成果物を作成する。
-- T01で記録したイメージdigestを再確認し、T01で記録した旧Gitコミットとマニフェストをロールバック成果物として固定する。必要なイメージがレジストリからpull可能であることを確認する。
+- T01で記録したイメージdigestを再確認し、T01で記録した不変image digest、Kubernetes構成、旧マニフェストの所在、設定・Secret参照をロールバック成果物として固定する。必要なイメージがレジストリからpull可能であることを確認する。
 - T01で記録した設定参照を使い、ロールバック用の新しいJWT_SECRETを組み込む手順と、旧構成を不変な成果物から再配備するチェックリストを作成する。可変タグだけをロールバック根拠にせず、T21で稼働中Podを唯一の情報源として初めてdigestを取得しない。
 - 一括切替チェックリストを作成し、SQL本文やShell本文を本タスクリストへ転記しない。
 
