@@ -4,6 +4,7 @@
 // T02で定義し、後続の認証タスクから順次接続する。
 #[allow(dead_code)]
 mod auth_foundation;
+mod postgres;
 
 #[allow(unused_imports)]
 use actix_cors::Cors;
