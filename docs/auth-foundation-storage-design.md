@@ -54,7 +54,7 @@ CREATE TABLE registered_web_services (
 
 ## 3. Redisキーと値
 
-キーの種類は次の4個だけである。`<lookup>`は`SHA-256(平文参照値)`の小文字16進表現であり、平文参照値そのものではない。
+Redisに実際に存在する認証基盤のキーは次の4 familyだけである。追加prefixは使わない。`<lookup>`は対応する平文参照値のASCIIバイト列にSHA-256を適用した小文字16進表現であり、64文字である。平文参照値そのものではない。
 
 ```text
 auth:external:<lookup>
@@ -63,27 +63,91 @@ auth:handoff:<lookup>
 auth:logout:<lookup>
 ```
 
-`auth:external:<lookup>`はHashで、`service_id`、Webサービスから受け取った`state`、`code_challenge`、`provider`、Google callbackを検証するための一時情報、`status`、`created_at`、`expires_at`を持つ。`status`は`waiting`または`processing`だけである。callback処理の完了後はキーを削除できる。
+概念状態モデルの参照値と、Redis上のlookup keyは別表現である。外部transaction reference、provider callback state、common session reference、handoff code、logout transaction referenceの平文はHash fieldへ保存しない。それぞれを識別するRedis keyの末尾に対応する`<lookup>`だけを使う。Hash valueはすべて単純な文字列であり、JSON、nested JSON、`serde_json` encoding、opaque serialized structを使わない。
 
-`auth:session:<lookup>`はHashで、`internal_user_id`、`authenticated_at`、`created_at`、`expires_at`を持つ。セッションの有効性はキーの存在と期限だけで表し、状態フィールドは持たない。ログアウトではこのキーを削除する。
+### 3.1 ExternalAuthTransaction
 
-`auth:handoff:<lookup>`はHashで、`service_id`、`internal_user_id`、対応する共通セッションのlookup、`code_challenge`、`authenticated_at`、`issued_at`、`expires_at`、`status`を持つ。`status`は`unused`または`used`だけである。正常な交換成功時だけ`used`に変え、使用済みHashは元の期限まで残す。
+`auth:external:<lookup>` は次のfieldだけを持つHashである。
 
-`auth:logout:<lookup>`はHashで、`service_id`、`logout_return_uri`、対応する共通セッションのlookup、CSRF検証情報、`created_at`、`expires_at`、`status`を持つ。`status`は`unused`または`used`だけである。
+```text
+service_id
+service_state
+handoff_code_challenge
+provider
+provider_verification_data
+created_at
+expires_at
+status
+```
 
-Redis Hash内の`created_at`、`authenticated_at`、`issued_at`、`expires_at`はすべて、Unix epochからの秒数を表す10進文字列として保存する。ミリ秒とマイクロ秒を使用せず、ISO 8601文字列をRedis Hashへ保存しない。Luaでは整数として比較する。PostgreSQLの`created_at`と`linked_at`は、引き続き`timestamptz`とする。
+`service_state`はWebサービスから受け取ったstateである。`provider_verification_data`はprovider callback検証に必要なopaque文字列値であり、JSON objectではない。`status`は`waiting`または`processing`だけである。概念モデルの`processing_status`は、このRedis物理schemaでは`status`に対応する。外部provider callbackを対応付ける平文state/referenceはHashに保存せず、key suffixのlookupで表現する。callback処理の完了後はキーを削除できる。
+
+### 3.2 CommonSession
+
+`auth:session:<lookup>` は次のfieldだけを持つHashである。
+
+```text
+internal_user_id
+authenticated_at
+created_at
+expires_at
+```
+
+`session_reference`および`status`は保存しない。session referenceはkey suffixのlookupで表現する。CommonSessionは「有効」の保存状態だけを持ち、不在または期限切れで無効を表現する。ログアウトではこのキーを削除する。
+
+### 3.3 AuthenticationHandoff
+
+`auth:handoff:<lookup>` は次のfieldだけを持つHashである。
+
+```text
+service_id
+internal_user_id
+common_session_lookup
+code_challenge
+authenticated_at
+issued_at
+expires_at
+status
+```
+
+`code_lookup_key`および`common_session_reference`はHash fieldへ保存しない。handoff code自体は保存せず、そのSHA-256小文字16進表現をkey suffixのlookupに使う。元のCommonSessionとの結び付きには平文referenceではなく、common session referenceのSHA-256小文字16進表現である`common_session_lookup`を保存する。`status`は`unused`または`used`だけであり、概念モデルの`usage_status`はこのRedis物理schemaでは`status`に対応する。正常な交換成功時だけ`used`に変え、使用済みHashは元の絶対期限まで残す。
+
+### 3.4 CommonLogoutTransaction
+
+`auth:logout:<lookup>` は次のfieldだけを持つHashである。
+
+```text
+service_id
+logout_return_uri
+csrf_lookup
+created_at
+expires_at
+status
+```
+
+`logout_transaction_reference`および平文の`csrf_verification_data`はHash fieldへ保存しない。logout transaction referenceはkey suffixのlookupで表現する。CSRFの平文tokenはブラウザ側へ渡し、RedisにはそのSHA-256小文字16進表現だけを`csrf_lookup`として保存する。概念モデルの`csrf_verification_data`はこのRedis物理schemaでは`csrf_lookup`に対応し、概念モデルの`usage_status`は`status`に対応する。`status`は`unused`または`used`だけである。
+
+各Hashのfield集合はexactである。field欠落、unknown追加field、unknown statusはいずれも不正な保存状態として扱い、将来互換性のための未知field許容は入れない。
+
+Redis Hash内の`created_at`、`authenticated_at`、`issued_at`、`expires_at`および`internal_user_id`はすべて10進文字列として保存する。時刻はUnix epochからの秒数であり、ミリ秒、マイクロ秒、ISO 8601文字列をRedis Hashへ保存しない。Luaでは時刻を整数として比較する。PostgreSQLの`created_at`と`linked_at`は、引き続き`timestamptz`とする。
 
 ## 4. 参照値とSecret
 
-外部認証callback用state、共通認証セッション参照、`handoff_code`、共通ログアウト一時参照、および`service_secret`は、次の形式で生成する。(1) OS乱数源から32バイトを生成する。(2) Base64url・パディングなしで文字列化する。(3) ブラウザ、Cookie、Webサービスへ渡す値にはこの文字列を使用する。(4) Redis lookupまたは`service_secret`検証値は、この文字列のASCIIバイト列にSHA-256を適用して生成する。参照値は呼出側へ渡した直後に破棄し、Redisには保存しない。Redisキー末尾のlookupだけはSHA-256結果の小文字16進表現とする。現在のCargo依存にはSHA-256 crateがないため、実装時にSHA-256用crateを追加する。PKCEのS256変換も認証基盤アプリケーションが行い、`code_verifier`をRedisへ渡したり保存したりしない。
+外部認証callback用state、共通認証セッション参照、`handoff_code`、共通ログアウト一時参照、および`service_secret`は、次の形式で生成する。(1) OS乱数源から32バイトを生成する。(2) Base64url・パディングなしで文字列化する。(3) ブラウザ、Cookie、Webサービスへ渡す値にはこの文字列を使用する。(4) Redis lookupまたは`service_secret`検証値は、この文字列のASCIIバイト列にSHA-256を適用して生成する。参照値は呼出側へ渡した直後に破棄し、Redisには保存しない。Redisキー末尾のlookupだけはSHA-256結果の小文字16進表現とする。PKCEのS256変換も認証基盤アプリケーションが行い、`code_verifier`をRedisへ渡したり保存したりしない。
 
 `service_secret`は上記の生成形式で認証基盤が生成し、Webサービスへ一度だけ文字列を渡す。DBにはその文字列のASCIIバイト列へSHA-256を適用した値だけを`service_secret_sha256`として保存する。受信した文字列も同じ方式でハッシュし、保存値と定数時間比較する。Webサービスは文字列をSecret管理領域へ保存し、ログ、URL、Cookie、フロントエンドへ出さない。これは人間が決めるパスワードではないため、初期実装にArgon2、bcrypt、PBKDF2、pepper、複数世代Secretは導入しない。ローテーション開始時は同じ検証値列を置換する。
 
 ## 5. TTL
 
-TTLは初期値として、外部認証トランザクションを10分、共通認証セッションを8時間、AuthenticationHandoffを2分、共通ログアウト一時状態を10分とする。すべてのHashに論理的な`expires_at`を保存し、同じ期限をRedis TTLとして設定する。読み取りおよびLua操作は`expires_at`も確認するため、RedisのTTLだけには依存しない。
+TTLは初期値として、外部認証トランザクションを600秒、共通認証セッションを28,800秒、AuthenticationHandoffを120秒、共通ログアウト一時状態を600秒とする。すべてのHashに論理的な`expires_at`を保存し、同じ絶対期限をRedis TTLとして設定する。通常書込みでは同じ`expires_at`を`EXPIREAT`へ渡す。読み取りおよびLua操作は`expires_at`も確認するため、RedisのTTLだけには依存しない。
 
 共通認証セッションは絶対有効期限であり、アクセスやSSO handoff発行ではTTLを延長しない。handoff使用済みHashのTTLも発行時の有効期限から変えない。
+
+### T07とT08の境界
+
+T07はkey生成、Hash encode/decode、通常read/write、`EXPIREAT`、logical `expires_at`確認、不在・期限切れ・Redis障害・不正状態の区別を担う。通常writeが複数Redis commandになることは許容する。認証上部分成功を許せない複数状態操作でT07 APIを組み合わせない。
+
+T08はcallback claim、`waiting`から`processing`への遷移、sessionとhandoffの同時作成、handoffの`unused`から`used`への遷移、logoutの`unused`から`used`への遷移、session削除との原子処理、Redis `TIME`、Luaを担う。これらの複数状態操作はT08のLuaだけで実行する。
 
 ## 6. 原子操作と部分失敗
 
@@ -101,7 +165,7 @@ SSO handoff発行は、共通セッションlookup、新しいhandoff lookup、�
 
 handoff交換では、Webサービスから受信した`code_verifier`を認証基盤アプリケーションで処理する。アプリケーションは`candidate_code_challenge = BASE64URL-NO-PADDING(SHA-256(ASCII(code_verifier)))`を算出し、Luaへはhandoff lookup、要求`service_id`、`candidate_code_challenge`を入力とする。Luaはhandoffの存在、期限、`status = unused`、サービス一致、保存済み`code_challenge`と`candidate_code_challenge`の一致、対応する共通セッションの存在と期限だけを確認する。`code_verifier`をRedisへ渡したり保存したりしない。成功時だけ必要値を返し、handoffを`used`へ変更する。同時交換では1件だけが成功し、不正要求または一時障害では`used`にしない。
 
-共通ログアウト完了は上記4種類へ統合できないため、5個目の最小Lua操作とする。Luaへはlogoutキーと共通sessionキーを明示的なRedisキー引数として渡す。Luaはlogout Hashの存在、期限内、`status = unused`、CSRF検証情報の一致、logout Hashに保存されたsession lookupと渡されたsessionキーの対応を確認してから、logoutを`used`へ変更し、共通sessionキーを削除し、`logout_return_uri`を返す。共通sessionキーが既に存在しない場合も、安全な冪等ログアウトとしてlogoutを`used`へ変更して成功できる。logoutの使用済み化と共通session削除をアプリケーション側の二つの処理へ分けない。logout Hashは期限まで残し、同時実行では1件だけが成功する。
+共通ログアウト完了は上記4種類へ統合できないため、5個目の最小Lua操作とする。Luaへはlogoutキーと、現在認証済みのcommon session referenceから導出した共通sessionキーを明示的なRedisキー引数として渡す。Luaはlogout Hashの存在、期限内、`status = unused`、`csrf_lookup`と受信CSRF tokenから導出したlookupの一致を確認してから、logoutを`used`へ変更し、渡された共通sessionキーを削除し、`logout_return_uri`を返す。CommonLogoutTransaction Hashにはcommon session referenceまたはsession lookupを保存しない。共通sessionキーが既に存在しない場合も、安全な冪等ログアウトとしてlogoutを`used`へ変更して成功できる。logoutの使用済み化と共通session削除をアプリケーション側の二つの処理へ分けない。logout Hashは期限まで残し、同時実行では1件だけが成功する。
 
 外部認証完了は、(1) Redisの外部認証トランザクションをclaim、(2) Google結果を検証、(3) PostgreSQLで`external_identities`から`internal_users`を解決、(4) 新規なら同一PostgreSQLトランザクションで両行を作成、(5) Redisで共通認証セッションとhandoffを原子的に作成、(6) Cookieとcallbackレスポンスを返す順とする。PostgreSQL成功後にRedis作成が失敗しても、作成済みのユーザー・外部IDは削除しない。認証成功を返さず、新しいログインを開始する。PostgreSQLとRedisの分散トランザクションは導入しない。
 
