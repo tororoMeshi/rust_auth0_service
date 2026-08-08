@@ -5,6 +5,7 @@
 #[allow(dead_code)]
 mod auth_foundation;
 mod postgres;
+mod redis_state;
 
 #[allow(unused_imports)]
 use actix_cors::Cors;
