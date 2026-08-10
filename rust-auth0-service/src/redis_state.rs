@@ -1,5 +1,5 @@
 use crate::auth_foundation::{is_unexpired, reference_value_lookup};
-use redis::aio::MultiplexedConnection;
+use redis::{aio::MultiplexedConnection, Script, Value};
 use std::collections::BTreeMap;
 
 pub(crate) const EXTERNAL_AUTH_TRANSACTION_TTL_SECONDS: u64 = 600;
@@ -41,6 +41,192 @@ const LOGOUT_FIELDS: [&str; 6] = [
     "expires_at",
     "status",
 ];
+
+const CALLBACK_CLAIM_SCRIPT: &str = r#"
+local function invalid() return {3} end
+local function uint(value)
+  if value == false or string.match(value, "^[+]?[0-9]+$") == nil then return false end
+  local number = tonumber(value)
+  return number ~= nil and number >= 0 and number <= 9007199254740991 and number == math.floor(number)
+end
+if redis.call("EXISTS", KEYS[1]) == 0 then return {1} end
+if redis.call("TYPE", KEYS[1]).ok ~= "hash" then return invalid() end
+if redis.call("HLEN", KEYS[1]) ~= 8 then return invalid() end
+local service_id = redis.call("HGET", KEYS[1], "service_id")
+local service_state = redis.call("HGET", KEYS[1], "service_state")
+local challenge = redis.call("HGET", KEYS[1], "handoff_code_challenge")
+local provider = redis.call("HGET", KEYS[1], "provider")
+local verification = redis.call("HGET", KEYS[1], "provider_verification_data")
+local created_at = redis.call("HGET", KEYS[1], "created_at")
+local expires_at = redis.call("HGET", KEYS[1], "expires_at")
+local status = redis.call("HGET", KEYS[1], "status")
+if service_id == false or service_state == false or challenge == false or provider == false or verification == false
+  or not uint(created_at) or not uint(expires_at) or status == false then return invalid() end
+local now = tonumber(redis.call("TIME")[1])
+local expiry = tonumber(expires_at)
+if now >= expiry then redis.call("DEL", KEYS[1]); return {2} end
+if redis.call("EXPIRETIME", KEYS[1]) ~= expiry then return invalid() end
+if status == "processing" then return {4} end
+if status ~= "waiting" then return invalid() end
+redis.call("HSET", KEYS[1], "status", "processing")
+return {0, service_id, service_state, challenge, provider, verification, created_at, expires_at, "processing"}
+"#;
+
+const ISSUE_SSO_HANDOFF_SCRIPT: &str = r#"
+local function invalid() return {3} end
+local function uint(value)
+  if value == false or string.match(value, "^[+]?[0-9]+$") == nil then return false end
+  local number = tonumber(value)
+  return number ~= nil and number >= 0 and number <= 9007199254740991 and number == math.floor(number)
+end
+local function int(value)
+  if value == false or string.match(value, "^[+-]?[0-9]+$") == nil then return false end
+  local number = tonumber(value)
+  return number ~= nil and number >= -2147483648 and number <= 2147483647 and number == math.floor(number)
+end
+local function lookup(value)
+  return value ~= false and string.match(value, "^[0-9a-f][0-9a-f]*$") ~= nil and string.len(value) == 64
+end
+if redis.call("EXISTS", KEYS[1]) == 0 then return {1} end
+if redis.call("TYPE", KEYS[1]).ok ~= "hash" then return invalid() end
+if redis.call("HLEN", KEYS[1]) ~= 4 then return invalid() end
+local session_user = redis.call("HGET", KEYS[1], "internal_user_id")
+local session_authenticated = redis.call("HGET", KEYS[1], "authenticated_at")
+local session_created = redis.call("HGET", KEYS[1], "created_at")
+local session_expires = redis.call("HGET", KEYS[1], "expires_at")
+if not int(session_user) or not uint(session_authenticated) or not uint(session_created) or not uint(session_expires) then return invalid() end
+local now = tonumber(redis.call("TIME")[1])
+if now >= tonumber(session_expires) then redis.call("DEL", KEYS[1]); return {2} end
+if redis.call("EXPIRETIME", KEYS[1]) ~= tonumber(session_expires) then return invalid() end
+if redis.call("EXISTS", KEYS[2]) ~= 0 then return {9} end
+if not lookup(ARGV[1]) or KEYS[1] ~= "auth:session:" .. ARGV[1] then return invalid() end
+if ARGV[9] ~= "unused" or not int(ARGV[3]) or not lookup(ARGV[4]) or not uint(ARGV[6])
+  or not uint(ARGV[7]) or not uint(ARGV[8]) then return invalid() end
+if ARGV[4] ~= ARGV[1] or tonumber(ARGV[3]) ~= tonumber(session_user) or tonumber(ARGV[6]) ~= tonumber(session_authenticated) then return invalid() end
+if tonumber(ARGV[8]) <= now then return {2} end
+redis.call("HSET", KEYS[2],
+  "service_id", ARGV[2], "internal_user_id", ARGV[3], "common_session_lookup", ARGV[4],
+  "code_challenge", ARGV[5], "authenticated_at", ARGV[6], "issued_at", ARGV[7],
+  "expires_at", ARGV[8], "status", ARGV[9])
+redis.call("EXPIREAT", KEYS[2], ARGV[8])
+return {0}
+"#;
+
+const CREATE_SESSION_AND_HANDOFF_SCRIPT: &str = r#"
+local function invalid() return {3} end
+local function uint(value)
+  if value == false or string.match(value, "^[+]?[0-9]+$") == nil then return false end
+  local number = tonumber(value)
+  return number ~= nil and number >= 0 and number <= 9007199254740991 and number == math.floor(number)
+end
+local function int(value)
+  if value == false or string.match(value, "^[+-]?[0-9]+$") == nil then return false end
+  local number = tonumber(value)
+  return number ~= nil and number >= -2147483648 and number <= 2147483647 and number == math.floor(number)
+end
+local function lookup(value)
+  return value ~= false and string.match(value, "^[0-9a-f][0-9a-f]*$") ~= nil and string.len(value) == 64
+end
+if redis.call("EXISTS", KEYS[1]) ~= 0 or redis.call("EXISTS", KEYS[2]) ~= 0 then return {9} end
+if not int(ARGV[1]) or not uint(ARGV[2]) or not uint(ARGV[3]) or not uint(ARGV[4])
+  or not lookup(ARGV[5]) or KEYS[1] ~= "auth:session:" .. ARGV[5] then return invalid() end
+if ARGV[13] ~= "unused" or not int(ARGV[7]) or not lookup(ARGV[8]) or not uint(ARGV[10])
+  or not uint(ARGV[11]) or not uint(ARGV[12]) then return invalid() end
+if ARGV[8] ~= ARGV[5] or tonumber(ARGV[7]) ~= tonumber(ARGV[1]) or tonumber(ARGV[10]) ~= tonumber(ARGV[2]) then return invalid() end
+local now = tonumber(redis.call("TIME")[1])
+if tonumber(ARGV[4]) <= now or tonumber(ARGV[12]) <= now then return {2} end
+redis.call("HSET", KEYS[1], "internal_user_id", ARGV[1], "authenticated_at", ARGV[2],
+  "created_at", ARGV[3], "expires_at", ARGV[4])
+redis.call("EXPIREAT", KEYS[1], ARGV[4])
+redis.call("HSET", KEYS[2], "service_id", ARGV[6], "internal_user_id", ARGV[7],
+  "common_session_lookup", ARGV[8], "code_challenge", ARGV[9], "authenticated_at", ARGV[10],
+  "issued_at", ARGV[11], "expires_at", ARGV[12], "status", ARGV[13])
+redis.call("EXPIREAT", KEYS[2], ARGV[12])
+return {0}
+"#;
+
+const EXCHANGE_HANDOFF_SCRIPT: &str = r#"
+local function invalid() return {3} end
+local function uint(value)
+  if value == false or string.match(value, "^[+]?[0-9]+$") == nil then return false end
+  local number = tonumber(value)
+  return number ~= nil and number >= 0 and number <= 9007199254740991 and number == math.floor(number)
+end
+local function int(value)
+  if value == false or string.match(value, "^[+-]?[0-9]+$") == nil then return false end
+  local number = tonumber(value)
+  return number ~= nil and number >= -2147483648 and number <= 2147483647 and number == math.floor(number)
+end
+local function lookup(value)
+  return value ~= false and string.match(value, "^[0-9a-f][0-9a-f]*$") ~= nil and string.len(value) == 64
+end
+if redis.call("EXISTS", KEYS[1]) == 0 then return {1} end
+if redis.call("TYPE", KEYS[1]).ok ~= "hash" then return invalid() end
+if redis.call("HLEN", KEYS[1]) ~= 8 then return invalid() end
+local handoff_service = redis.call("HGET", KEYS[1], "service_id")
+local handoff_user = redis.call("HGET", KEYS[1], "internal_user_id")
+local handoff_lookup = redis.call("HGET", KEYS[1], "common_session_lookup")
+local handoff_challenge = redis.call("HGET", KEYS[1], "code_challenge")
+local handoff_authenticated = redis.call("HGET", KEYS[1], "authenticated_at")
+local handoff_issued = redis.call("HGET", KEYS[1], "issued_at")
+local handoff_expires = redis.call("HGET", KEYS[1], "expires_at")
+local handoff_status = redis.call("HGET", KEYS[1], "status")
+if handoff_service == false or not int(handoff_user) or not lookup(handoff_lookup) or handoff_challenge == false
+  or not uint(handoff_authenticated) or not uint(handoff_issued) or not uint(handoff_expires) or handoff_status == false then return invalid() end
+local now = tonumber(redis.call("TIME")[1])
+if now >= tonumber(handoff_expires) then redis.call("DEL", KEYS[1]); return {2} end
+if redis.call("EXPIRETIME", KEYS[1]) ~= tonumber(handoff_expires) then return invalid() end
+if handoff_status == "used" then return {5} end
+if handoff_status ~= "unused" then return invalid() end
+if handoff_service ~= ARGV[1] then return {6} end
+if handoff_challenge ~= ARGV[2] then return {7} end
+if not lookup(ARGV[3]) or handoff_lookup ~= ARGV[3] or KEYS[2] ~= "auth:session:" .. ARGV[3] then return invalid() end
+if redis.call("EXISTS", KEYS[2]) == 0 then return {1} end
+if redis.call("TYPE", KEYS[2]).ok ~= "hash" then return invalid() end
+if redis.call("HLEN", KEYS[2]) ~= 4 then return invalid() end
+local session_user = redis.call("HGET", KEYS[2], "internal_user_id")
+local session_authenticated = redis.call("HGET", KEYS[2], "authenticated_at")
+local session_created = redis.call("HGET", KEYS[2], "created_at")
+local session_expires = redis.call("HGET", KEYS[2], "expires_at")
+if not int(session_user) or not uint(session_authenticated) or not uint(session_created) or not uint(session_expires) then return invalid() end
+if now >= tonumber(session_expires) then redis.call("DEL", KEYS[2]); return {2} end
+if redis.call("EXPIRETIME", KEYS[2]) ~= tonumber(session_expires) then return invalid() end
+if tonumber(handoff_user) ~= tonumber(session_user) or tonumber(handoff_authenticated) ~= tonumber(session_authenticated) then return invalid() end
+redis.call("HSET", KEYS[1], "status", "used")
+return {0, tonumber(handoff_user), tonumber(handoff_authenticated)}
+"#;
+
+const COMPLETE_COMMON_LOGOUT_SCRIPT: &str = r#"
+local function invalid() return {3} end
+local function uint(value)
+  if value == false or string.match(value, "^[+]?[0-9]+$") == nil then return false end
+  local number = tonumber(value)
+  return number ~= nil and number >= 0 and number <= 9007199254740991 and number == math.floor(number)
+end
+local function lookup(value)
+  return value ~= false and string.match(value, "^[0-9a-f][0-9a-f]*$") ~= nil and string.len(value) == 64
+end
+if redis.call("EXISTS", KEYS[1]) == 0 then return {1} end
+if redis.call("TYPE", KEYS[1]).ok ~= "hash" then return invalid() end
+if redis.call("HLEN", KEYS[1]) ~= 6 then return invalid() end
+local service_id = redis.call("HGET", KEYS[1], "service_id")
+local return_uri = redis.call("HGET", KEYS[1], "logout_return_uri")
+local csrf_lookup = redis.call("HGET", KEYS[1], "csrf_lookup")
+local created_at = redis.call("HGET", KEYS[1], "created_at")
+local expires_at = redis.call("HGET", KEYS[1], "expires_at")
+local status = redis.call("HGET", KEYS[1], "status")
+if service_id == false or return_uri == false or not lookup(csrf_lookup) or not uint(created_at)
+  or not uint(expires_at) or status == false then return invalid() end
+local now = tonumber(redis.call("TIME")[1])
+if now >= tonumber(expires_at) then redis.call("DEL", KEYS[1]); return {2} end
+if redis.call("EXPIRETIME", KEYS[1]) ~= tonumber(expires_at) then return invalid() end
+if status == "used" then return {5} end
+if status ~= "unused" then return invalid() end
+if csrf_lookup ~= ARGV[1] then return {8} end
+redis.call("HSET", KEYS[1], "status", "used")
+redis.call("DEL", KEYS[2])
+return {0, return_uri}
+"#;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ExternalAuthTransaction {
@@ -102,6 +288,18 @@ pub(crate) enum RedisStateError {
     Expired,
     RedisFailure,
     InvalidStoredState,
+    AlreadyClaimed,
+    AlreadyUsed,
+    ServiceMismatch,
+    ChallengeMismatch,
+    CsrfMismatch,
+    KeyConflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HandoffExchangeResult {
+    pub(crate) internal_user_id: i32,
+    pub(crate) authenticated_at: u64,
 }
 
 pub(crate) fn external_key(reference: &str) -> String {
@@ -110,6 +308,13 @@ pub(crate) fn external_key(reference: &str) -> String {
 
 pub(crate) fn session_key(reference: &str) -> String {
     format!("auth:session:{}", reference_value_lookup(reference))
+}
+
+fn session_key_from_lookup(lookup: &str) -> Result<String, RedisStateError> {
+    if !is_lookup(lookup) {
+        return Err(RedisStateError::InvalidStoredState);
+    }
+    Ok(format!("auth:session:{lookup}"))
 }
 
 pub(crate) fn handoff_key(reference: &str) -> String {
@@ -230,6 +435,229 @@ pub(crate) async fn read_logout(
     let state = decode_logout(&fields)?;
     expire_if_needed(connection, &key, state.expires_at, now).await?;
     Ok(state)
+}
+
+pub(crate) async fn claim_external_callback(
+    connection: &mut MultiplexedConnection,
+    external_reference: &str,
+) -> Result<ExternalAuthTransaction, RedisStateError> {
+    let script = Script::new(CALLBACK_CLAIM_SCRIPT);
+    let mut invocation = script.prepare_invoke();
+    invocation.key(external_key(external_reference));
+    let reply: Vec<Value> = invocation
+        .invoke_async(connection)
+        .await
+        .map_err(|_| RedisStateError::RedisFailure)?;
+
+    match reply.as_slice() {
+        [Value::Int(0), service_id, service_state, challenge, provider, verification, created_at, expires_at, status] =>
+        {
+            let mut fields = BTreeMap::new();
+            fields.insert("service_id".to_owned(), reply_string(service_id)?);
+            fields.insert("service_state".to_owned(), reply_string(service_state)?);
+            fields.insert(
+                "handoff_code_challenge".to_owned(),
+                reply_string(challenge)?,
+            );
+            fields.insert("provider".to_owned(), reply_string(provider)?);
+            fields.insert(
+                "provider_verification_data".to_owned(),
+                reply_string(verification)?,
+            );
+            fields.insert("created_at".to_owned(), reply_string(created_at)?);
+            fields.insert("expires_at".to_owned(), reply_string(expires_at)?);
+            fields.insert("status".to_owned(), reply_string(status)?);
+            let state = decode_external(&fields)?;
+            if state.status != ExternalStatus::Processing {
+                return Err(RedisStateError::InvalidStoredState);
+            }
+            Ok(state)
+        }
+        [Value::Int(code)] => script_error(*code),
+        _ => Err(RedisStateError::InvalidStoredState),
+    }
+}
+
+pub(crate) async fn issue_sso_handoff(
+    connection: &mut MultiplexedConnection,
+    common_session_reference: &str,
+    handoff_reference: &str,
+    handoff: &AuthenticationHandoff,
+) -> Result<(), RedisStateError> {
+    let session_lookup = reference_value_lookup(common_session_reference);
+    let script = Script::new(ISSUE_SSO_HANDOFF_SCRIPT);
+    let mut invocation = script.prepare_invoke();
+    invocation
+        .key(session_key(common_session_reference))
+        .key(handoff_key(handoff_reference))
+        .arg(session_lookup)
+        .arg(&handoff.service_id)
+        .arg(handoff.internal_user_id.to_string())
+        .arg(&handoff.common_session_lookup)
+        .arg(&handoff.code_challenge)
+        .arg(handoff.authenticated_at.to_string())
+        .arg(handoff.issued_at.to_string())
+        .arg(handoff.expires_at.to_string())
+        .arg(usage_status_value(&handoff.status));
+    let reply: Vec<Value> = invocation
+        .invoke_async(connection)
+        .await
+        .map_err(|_| RedisStateError::RedisFailure)?;
+    match reply.as_slice() {
+        [Value::Int(0)] => Ok(()),
+        [Value::Int(code)] => script_error(*code),
+        _ => Err(RedisStateError::InvalidStoredState),
+    }
+}
+
+pub(crate) async fn create_session_and_handoff(
+    connection: &mut MultiplexedConnection,
+    common_session_reference: &str,
+    session: &CommonSession,
+    handoff_reference: &str,
+    handoff: &AuthenticationHandoff,
+) -> Result<(), RedisStateError> {
+    let session_lookup = reference_value_lookup(common_session_reference);
+    let script = Script::new(CREATE_SESSION_AND_HANDOFF_SCRIPT);
+    let mut invocation = script.prepare_invoke();
+    invocation
+        .key(session_key(common_session_reference))
+        .key(handoff_key(handoff_reference))
+        .arg(session.internal_user_id.to_string())
+        .arg(session.authenticated_at.to_string())
+        .arg(session.created_at.to_string())
+        .arg(session.expires_at.to_string())
+        .arg(session_lookup)
+        .arg(&handoff.service_id)
+        .arg(handoff.internal_user_id.to_string())
+        .arg(&handoff.common_session_lookup)
+        .arg(&handoff.code_challenge)
+        .arg(handoff.authenticated_at.to_string())
+        .arg(handoff.issued_at.to_string())
+        .arg(handoff.expires_at.to_string())
+        .arg(usage_status_value(&handoff.status));
+    let reply: Vec<Value> = invocation
+        .invoke_async(connection)
+        .await
+        .map_err(|_| RedisStateError::RedisFailure)?;
+    match reply.as_slice() {
+        [Value::Int(0)] => Ok(()),
+        [Value::Int(code)] => script_error(*code),
+        _ => Err(RedisStateError::InvalidStoredState),
+    }
+}
+
+pub(crate) async fn exchange_handoff(
+    connection: &mut MultiplexedConnection,
+    handoff_reference: &str,
+    service_id: &str,
+    candidate_code_challenge: &str,
+) -> Result<HandoffExchangeResult, RedisStateError> {
+    let common_session_lookup =
+        resolve_handoff_session_lookup(connection, handoff_reference).await?;
+    let session_key = session_key_from_lookup(&common_session_lookup)?;
+    let script = Script::new(EXCHANGE_HANDOFF_SCRIPT);
+    let mut invocation = script.prepare_invoke();
+    invocation
+        .key(handoff_key(handoff_reference))
+        .key(session_key)
+        .arg(service_id)
+        .arg(candidate_code_challenge)
+        .arg(common_session_lookup);
+    let reply: Vec<Value> = invocation
+        .invoke_async(connection)
+        .await
+        .map_err(|_| RedisStateError::RedisFailure)?;
+    match reply.as_slice() {
+        [Value::Int(0), Value::Int(internal_user_id), Value::Int(authenticated_at)] => {
+            let internal_user_id = i32::try_from(*internal_user_id)
+                .map_err(|_| RedisStateError::InvalidStoredState)?;
+            let authenticated_at = u64::try_from(*authenticated_at)
+                .map_err(|_| RedisStateError::InvalidStoredState)?;
+            Ok(HandoffExchangeResult {
+                internal_user_id,
+                authenticated_at,
+            })
+        }
+        [Value::Int(code)] => script_error(*code),
+        _ => Err(RedisStateError::InvalidStoredState),
+    }
+}
+
+pub(crate) async fn complete_common_logout(
+    connection: &mut MultiplexedConnection,
+    logout_reference: &str,
+    common_session_reference: &str,
+    csrf_lookup: &str,
+) -> Result<String, RedisStateError> {
+    let script = Script::new(COMPLETE_COMMON_LOGOUT_SCRIPT);
+    let mut invocation = script.prepare_invoke();
+    invocation
+        .key(logout_key(logout_reference))
+        .key(session_key(common_session_reference))
+        .arg(csrf_lookup);
+    let reply: Vec<Value> = invocation
+        .invoke_async(connection)
+        .await
+        .map_err(|_| RedisStateError::RedisFailure)?;
+    match reply.as_slice() {
+        [Value::Int(0), return_uri] => reply_string(return_uri),
+        [Value::Int(code)] => script_error(*code),
+        _ => Err(RedisStateError::InvalidStoredState),
+    }
+}
+
+async fn resolve_handoff_session_lookup(
+    connection: &mut MultiplexedConnection,
+    handoff_reference: &str,
+) -> Result<String, RedisStateError> {
+    let key = handoff_key(handoff_reference);
+    let key_type: String = redis::cmd("TYPE")
+        .arg(&key)
+        .query_async(connection)
+        .await
+        .map_err(|_| RedisStateError::RedisFailure)?;
+    match key_type.as_str() {
+        "none" => return Err(RedisStateError::NotFound),
+        "hash" => {}
+        _ => return Err(RedisStateError::InvalidStoredState),
+    }
+
+    let lookup: Option<String> = redis::cmd("HGET")
+        .arg(&key)
+        .arg("common_session_lookup")
+        .query_async(connection)
+        .await
+        .map_err(|_| RedisStateError::RedisFailure)?;
+    let lookup = lookup.ok_or(RedisStateError::InvalidStoredState)?;
+    if !is_lookup(&lookup) {
+        return Err(RedisStateError::InvalidStoredState);
+    }
+    Ok(lookup)
+}
+
+fn reply_string(value: &Value) -> Result<String, RedisStateError> {
+    match value {
+        Value::BulkString(value) => {
+            String::from_utf8(value.clone()).map_err(|_| RedisStateError::InvalidStoredState)
+        }
+        _ => Err(RedisStateError::InvalidStoredState),
+    }
+}
+
+fn script_error<T>(code: i64) -> Result<T, RedisStateError> {
+    match code {
+        1 => Err(RedisStateError::NotFound),
+        2 => Err(RedisStateError::Expired),
+        3 => Err(RedisStateError::InvalidStoredState),
+        4 => Err(RedisStateError::AlreadyClaimed),
+        5 => Err(RedisStateError::AlreadyUsed),
+        6 => Err(RedisStateError::ServiceMismatch),
+        7 => Err(RedisStateError::ChallengeMismatch),
+        8 => Err(RedisStateError::CsrfMismatch),
+        9 => Err(RedisStateError::KeyConflict),
+        _ => Err(RedisStateError::InvalidStoredState),
+    }
 }
 
 async fn write_state(
@@ -542,6 +970,46 @@ mod tests {
             .collect()
     }
 
+    async fn redis_exists(connection: &mut MultiplexedConnection, key: &str) -> bool {
+        redis::cmd("EXISTS")
+            .arg(key)
+            .query_async(connection)
+            .await
+            .unwrap()
+    }
+
+    async fn redis_status(connection: &mut MultiplexedConnection, key: &str) -> String {
+        redis::cmd("HGET")
+            .arg(key)
+            .arg("status")
+            .query_async(connection)
+            .await
+            .unwrap()
+    }
+
+    async fn redis_expiretime(connection: &mut MultiplexedConnection, key: &str) -> i64 {
+        redis::cmd("EXPIRETIME")
+            .arg(key)
+            .query_async(connection)
+            .await
+            .unwrap()
+    }
+
+    async fn set_hash_field(
+        connection: &mut MultiplexedConnection,
+        key: &str,
+        field: &str,
+        value: impl redis::ToRedisArgs,
+    ) {
+        redis::cmd("HSET")
+            .arg(key)
+            .arg(field)
+            .arg(value)
+            .query_async::<()>(connection)
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn keys_use_only_the_four_hashed_key_families() {
         let reference = "plain-reference-must-not-appear";
@@ -840,6 +1308,904 @@ mod tests {
                 .query_async(&mut connection)
                 .await
                 .unwrap();
+        }
+    }
+
+    #[actix_web::test]
+    #[ignore = "requires AUTH_FOUNDATION_TEST_REDIS_URL and a disposable Redis 7 instance"]
+    async fn t08_redis_lua_atomic_operations() {
+        let redis_url = std::env::var("AUTH_FOUNDATION_TEST_REDIS_URL")
+            .expect("AUTH_FOUNDATION_TEST_REDIS_URL must be set for this ignored test");
+        let client = redis::Client::open(redis_url.clone()).unwrap();
+        let mut connection = client.get_multiplexed_async_connection().await.unwrap();
+        let now: u64 = redis::cmd("TIME")
+            .query_async::<(u64, u64)>(&mut connection)
+            .await
+            .unwrap()
+            .0;
+        let external_reference = "t08-external";
+        let session_reference = "t08-session";
+        let handoff_reference = "t08-handoff";
+        let issued_handoff_reference = "t08-issued-handoff";
+        let concurrent_exchange_reference = "t08-concurrent-exchange";
+        let logout_reference = "t08-logout";
+        let logout_session_reference = "t08-logout-session";
+        let concurrent_logout_reference = "t08-concurrent-logout";
+        let concurrent_logout_session_reference = "t08-concurrent-logout-session";
+        let keys = [
+            external_key(external_reference),
+            session_key(session_reference),
+            handoff_key(handoff_reference),
+            handoff_key(issued_handoff_reference),
+            handoff_key(concurrent_exchange_reference),
+            logout_key(logout_reference),
+            session_key(logout_session_reference),
+            logout_key(concurrent_logout_reference),
+            session_key(concurrent_logout_session_reference),
+        ];
+        for key in &keys {
+            redis::cmd("DEL")
+                .arg(key)
+                .query_async::<()>(&mut connection)
+                .await
+                .unwrap();
+        }
+
+        let mut callback = external();
+        callback.expires_at = now + 120;
+        write_external(&mut connection, external_reference, &callback, now)
+            .await
+            .unwrap();
+        let claimed = claim_external_callback(&mut connection, external_reference)
+            .await
+            .unwrap();
+        assert_eq!(claimed.status, ExternalStatus::Processing);
+        assert_eq!(
+            claim_external_callback(&mut connection, external_reference).await,
+            Err(RedisStateError::AlreadyClaimed)
+        );
+        assert_eq!(
+            claim_external_callback(&mut connection, "t08-missing").await,
+            Err(RedisStateError::NotFound)
+        );
+
+        let concurrent_reference = "t08-concurrent-claim";
+        let concurrent_key = external_key(concurrent_reference);
+        let mut concurrent = external();
+        concurrent.expires_at = now + 120;
+        write_external(&mut connection, concurrent_reference, &concurrent, now)
+            .await
+            .unwrap();
+        let first_url = redis_url.clone();
+        let second_url = redis_url.clone();
+        let first = actix_web::rt::spawn(async move {
+            let client = redis::Client::open(first_url).unwrap();
+            let mut connection = client.get_multiplexed_async_connection().await.unwrap();
+            claim_external_callback(&mut connection, concurrent_reference).await
+        });
+        let second = actix_web::rt::spawn(async move {
+            let client = redis::Client::open(second_url).unwrap();
+            let mut connection = client.get_multiplexed_async_connection().await.unwrap();
+            claim_external_callback(&mut connection, concurrent_reference).await
+        });
+        let outcomes = [first.await.unwrap(), second.await.unwrap()];
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == Err(RedisStateError::AlreadyClaimed))
+                .count(),
+            1
+        );
+
+        let mut session_state = session();
+        session_state.expires_at = now + 300;
+        let mut initial_handoff = handoff(UsageStatus::Unused);
+        initial_handoff.common_session_lookup = reference_value_lookup(session_reference);
+        initial_handoff.expires_at = now + 120;
+        create_session_and_handoff(
+            &mut connection,
+            session_reference,
+            &session_state,
+            handoff_reference,
+            &initial_handoff,
+        )
+        .await
+        .unwrap();
+        for (key, expires_at) in [
+            (session_key(session_reference), session_state.expires_at),
+            (handoff_key(handoff_reference), initial_handoff.expires_at),
+        ] {
+            let expiretime: i64 = redis::cmd("EXPIRETIME")
+                .arg(key)
+                .query_async(&mut connection)
+                .await
+                .unwrap();
+            assert_eq!(expiretime, expires_at as i64);
+        }
+        assert_eq!(
+            create_session_and_handoff(
+                &mut connection,
+                session_reference,
+                &session_state,
+                "t08-conflicting-handoff",
+                &initial_handoff,
+            )
+            .await,
+            Err(RedisStateError::KeyConflict)
+        );
+        assert!(!redis::cmd("EXISTS")
+            .arg(handoff_key("t08-conflicting-handoff"))
+            .query_async::<bool>(&mut connection)
+            .await
+            .unwrap());
+
+        let session_expiretime_before: i64 = redis::cmd("EXPIRETIME")
+            .arg(session_key(session_reference))
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        let mut issued_handoff = handoff(UsageStatus::Unused);
+        issued_handoff.common_session_lookup = reference_value_lookup(session_reference);
+        issued_handoff.expires_at = now + 110;
+        issue_sso_handoff(
+            &mut connection,
+            session_reference,
+            issued_handoff_reference,
+            &issued_handoff,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            redis::cmd("EXPIRETIME")
+                .arg(session_key(session_reference))
+                .query_async::<i64>(&mut connection)
+                .await
+                .unwrap(),
+            session_expiretime_before
+        );
+        assert_eq!(
+            issue_sso_handoff(
+                &mut connection,
+                session_reference,
+                issued_handoff_reference,
+                &issued_handoff,
+            )
+            .await,
+            Err(RedisStateError::KeyConflict)
+        );
+        let handoff_expiretime_before: i64 = redis::cmd("EXPIRETIME")
+            .arg(handoff_key(issued_handoff_reference))
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        assert_eq!(
+            exchange_handoff(
+                &mut connection,
+                issued_handoff_reference,
+                "service",
+                "challenge",
+            )
+            .await,
+            Ok(HandoffExchangeResult {
+                internal_user_id: 42,
+                authenticated_at: 101,
+            })
+        );
+        assert_eq!(
+            redis::cmd("EXPIRETIME")
+                .arg(handoff_key(issued_handoff_reference))
+                .query_async::<i64>(&mut connection)
+                .await
+                .unwrap(),
+            handoff_expiretime_before
+        );
+        assert_eq!(
+            exchange_handoff(
+                &mut connection,
+                issued_handoff_reference,
+                "service",
+                "challenge",
+            )
+            .await,
+            Err(RedisStateError::AlreadyUsed)
+        );
+
+        let mut concurrent_exchange = handoff(UsageStatus::Unused);
+        concurrent_exchange.common_session_lookup = reference_value_lookup(session_reference);
+        concurrent_exchange.expires_at = now + 100;
+        issue_sso_handoff(
+            &mut connection,
+            session_reference,
+            concurrent_exchange_reference,
+            &concurrent_exchange,
+        )
+        .await
+        .unwrap();
+        let first_url = redis_url.clone();
+        let second_url = redis_url.clone();
+        let first = actix_web::rt::spawn(async move {
+            let client = redis::Client::open(first_url).unwrap();
+            let mut connection = client.get_multiplexed_async_connection().await.unwrap();
+            exchange_handoff(
+                &mut connection,
+                concurrent_exchange_reference,
+                "service",
+                "challenge",
+            )
+            .await
+        });
+        let second = actix_web::rt::spawn(async move {
+            let client = redis::Client::open(second_url).unwrap();
+            let mut connection = client.get_multiplexed_async_connection().await.unwrap();
+            exchange_handoff(
+                &mut connection,
+                concurrent_exchange_reference,
+                "service",
+                "challenge",
+            )
+            .await
+        });
+        let outcomes = [first.await.unwrap(), second.await.unwrap()];
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == Err(RedisStateError::AlreadyUsed))
+                .count(),
+            1
+        );
+
+        let mut logout_state = logout();
+        logout_state.expires_at = now + 120;
+        let mut logout_session = session();
+        logout_session.expires_at = now + 120;
+        write_logout(&mut connection, logout_reference, &logout_state, now)
+            .await
+            .unwrap();
+        write_session(
+            &mut connection,
+            logout_session_reference,
+            &logout_session,
+            now,
+        )
+        .await
+        .unwrap();
+        let logout_expiretime_before: i64 = redis::cmd("EXPIRETIME")
+            .arg(logout_key(logout_reference))
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        assert_eq!(
+            complete_common_logout(
+                &mut connection,
+                logout_reference,
+                logout_session_reference,
+                &logout_state.csrf_lookup,
+            )
+            .await,
+            Ok(logout_state.logout_return_uri.clone())
+        );
+        assert_eq!(
+            redis::cmd("EXPIRETIME")
+                .arg(logout_key(logout_reference))
+                .query_async::<i64>(&mut connection)
+                .await
+                .unwrap(),
+            logout_expiretime_before
+        );
+        assert!(redis::cmd("EXISTS")
+            .arg(logout_key(logout_reference))
+            .query_async::<bool>(&mut connection)
+            .await
+            .unwrap());
+        assert!(!redis::cmd("EXISTS")
+            .arg(session_key(logout_session_reference))
+            .query_async::<bool>(&mut connection)
+            .await
+            .unwrap());
+        assert_eq!(
+            complete_common_logout(
+                &mut connection,
+                logout_reference,
+                logout_session_reference,
+                &logout_state.csrf_lookup,
+            )
+            .await,
+            Err(RedisStateError::AlreadyUsed)
+        );
+
+        let mut concurrent_logout = logout();
+        concurrent_logout.expires_at = now + 100;
+        let mut concurrent_logout_session = session();
+        concurrent_logout_session.expires_at = now + 100;
+        write_logout(
+            &mut connection,
+            concurrent_logout_reference,
+            &concurrent_logout,
+            now,
+        )
+        .await
+        .unwrap();
+        write_session(
+            &mut connection,
+            concurrent_logout_session_reference,
+            &concurrent_logout_session,
+            now,
+        )
+        .await
+        .unwrap();
+        let first_url = redis_url.clone();
+        let second_url = redis_url.clone();
+        let csrf_lookup = concurrent_logout.csrf_lookup.clone();
+        let first = actix_web::rt::spawn(async move {
+            let client = redis::Client::open(first_url).unwrap();
+            let mut connection = client.get_multiplexed_async_connection().await.unwrap();
+            complete_common_logout(
+                &mut connection,
+                concurrent_logout_reference,
+                concurrent_logout_session_reference,
+                &csrf_lookup,
+            )
+            .await
+        });
+        let csrf_lookup = concurrent_logout.csrf_lookup.clone();
+        let second = actix_web::rt::spawn(async move {
+            let client = redis::Client::open(second_url).unwrap();
+            let mut connection = client.get_multiplexed_async_connection().await.unwrap();
+            complete_common_logout(
+                &mut connection,
+                concurrent_logout_reference,
+                concurrent_logout_session_reference,
+                &csrf_lookup,
+            )
+            .await
+        });
+        let outcomes = [first.await.unwrap(), second.await.unwrap()];
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == Err(RedisStateError::AlreadyUsed))
+                .count(),
+            1
+        );
+
+        let expired_reference = "t08-logical-expired";
+        let expired_key = external_key(expired_reference);
+        let mut future_ttl = external();
+        future_ttl.expires_at = now + 60;
+        write_external(&mut connection, expired_reference, &future_ttl, now)
+            .await
+            .unwrap();
+        redis::cmd("HSET")
+            .arg(&expired_key)
+            .arg("expires_at")
+            .arg(now - 1)
+            .query_async::<()>(&mut connection)
+            .await
+            .unwrap();
+        assert_eq!(
+            claim_external_callback(&mut connection, expired_reference).await,
+            Err(RedisStateError::Expired)
+        );
+        assert!(!redis::cmd("EXISTS")
+            .arg(&expired_key)
+            .query_async::<bool>(&mut connection)
+            .await
+            .unwrap());
+
+        for key in keys.iter().chain([concurrent_key, expired_key].iter()) {
+            redis::cmd("DEL")
+                .arg(key)
+                .query_async::<()>(&mut connection)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[actix_web::test]
+    #[ignore = "requires AUTH_FOUNDATION_TEST_REDIS_URL and a disposable Redis 7 instance"]
+    async fn t08_redis_lua_rejects_invalid_states_without_mutation() {
+        let redis_url = std::env::var("AUTH_FOUNDATION_TEST_REDIS_URL")
+            .expect("AUTH_FOUNDATION_TEST_REDIS_URL must be set for this ignored test");
+        let client = redis::Client::open(redis_url).unwrap();
+        let mut connection = client.get_multiplexed_async_connection().await.unwrap();
+        let now: u64 = redis::cmd("TIME")
+            .query_async::<(u64, u64)>(&mut connection)
+            .await
+            .unwrap()
+            .0;
+        let prefix = format!("t08-review-{now}");
+        let callback_malformed = format!("{prefix}-callback-malformed");
+        let callback_range = format!("{prefix}-callback-range");
+        let missing_session = format!("{prefix}-missing-session");
+        let missing_handoff = format!("{prefix}-missing-handoff");
+        let expired_session = format!("{prefix}-expired-session");
+        let expired_handoff = format!("{prefix}-expired-handoff");
+        let conflict_session = format!("{prefix}-conflict-session");
+        let conflict_handoff = format!("{prefix}-conflict-handoff");
+        let initial_new_session = format!("{prefix}-initial-new-session");
+        let initial_new_handoff = format!("{prefix}-initial-new-handoff");
+        let initial_handoff_session = format!("{prefix}-initial-handoff-session");
+        let exchange_session = format!("{prefix}-exchange-session");
+        let exchange_handoff_reference = format!("{prefix}-exchange-handoff");
+        let missing_exchange_handoff = format!("{prefix}-missing-exchange-handoff");
+        let expired_exchange_session = format!("{prefix}-expired-exchange-session");
+        let expired_exchange_handoff = format!("{prefix}-expired-exchange-handoff");
+        let mismatch_user_handoff = format!("{prefix}-mismatch-user-handoff");
+        let mismatch_auth_handoff = format!("{prefix}-mismatch-auth-handoff");
+        let malformed_handoff = format!("{prefix}-malformed-handoff");
+        let range_handoff = format!("{prefix}-range-handoff");
+        let ttl_handoff = format!("{prefix}-ttl-handoff");
+        let logout_csrf = format!("{prefix}-logout-csrf");
+        let logout_csrf_session = format!("{prefix}-logout-csrf-session");
+        let logout_expired = format!("{prefix}-logout-expired");
+        let logout_absent_session = format!("{prefix}-logout-absent-session");
+        let cleanup_references = [
+            &callback_malformed,
+            &callback_range,
+            &missing_session,
+            &missing_handoff,
+            &expired_session,
+            &expired_handoff,
+            &conflict_session,
+            &conflict_handoff,
+            &initial_new_session,
+            &initial_new_handoff,
+            &initial_handoff_session,
+            &exchange_session,
+            &exchange_handoff_reference,
+            &missing_exchange_handoff,
+            &expired_exchange_session,
+            &expired_exchange_handoff,
+            &mismatch_user_handoff,
+            &mismatch_auth_handoff,
+            &malformed_handoff,
+            &range_handoff,
+            &ttl_handoff,
+            &logout_csrf,
+            &logout_csrf_session,
+            &logout_expired,
+            &logout_absent_session,
+        ];
+        for reference in cleanup_references {
+            for key in [
+                external_key(reference),
+                session_key(reference),
+                handoff_key(reference),
+                logout_key(reference),
+            ] {
+                redis::cmd("DEL")
+                    .arg(key)
+                    .query_async::<()>(&mut connection)
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let mut external_state = external();
+        external_state.expires_at = now + 120;
+        write_external(&mut connection, &callback_malformed, &external_state, now)
+            .await
+            .unwrap();
+        let callback_malformed_key = external_key(&callback_malformed);
+        set_hash_field(
+            &mut connection,
+            &callback_malformed_key,
+            "unexpected",
+            "value",
+        )
+        .await;
+        assert_eq!(
+            claim_external_callback(&mut connection, &callback_malformed).await,
+            Err(RedisStateError::InvalidStoredState)
+        );
+        assert_eq!(
+            redis_status(&mut connection, &callback_malformed_key).await,
+            "waiting"
+        );
+
+        write_external(&mut connection, &callback_range, &external_state, now)
+            .await
+            .unwrap();
+        let callback_range_key = external_key(&callback_range);
+        set_hash_field(
+            &mut connection,
+            &callback_range_key,
+            "created_at",
+            "9007199254740992",
+        )
+        .await;
+        assert_eq!(
+            claim_external_callback(&mut connection, &callback_range).await,
+            Err(RedisStateError::InvalidStoredState)
+        );
+        assert_eq!(
+            redis_status(&mut connection, &callback_range_key).await,
+            "waiting"
+        );
+
+        let mut handoff_state = handoff(UsageStatus::Unused);
+        handoff_state.common_session_lookup = reference_value_lookup(&missing_session);
+        handoff_state.expires_at = now + 120;
+        assert_eq!(
+            issue_sso_handoff(
+                &mut connection,
+                &missing_session,
+                &missing_handoff,
+                &handoff_state,
+            )
+            .await,
+            Err(RedisStateError::NotFound)
+        );
+        assert!(!redis_exists(&mut connection, &handoff_key(&missing_handoff)).await);
+
+        let mut expired_session_state = session();
+        expired_session_state.expires_at = now + 120;
+        write_session(
+            &mut connection,
+            &expired_session,
+            &expired_session_state,
+            now,
+        )
+        .await
+        .unwrap();
+        set_hash_field(
+            &mut connection,
+            &session_key(&expired_session),
+            "expires_at",
+            (now - 1).to_string(),
+        )
+        .await;
+        let mut expired_handoff_state = handoff(UsageStatus::Unused);
+        expired_handoff_state.common_session_lookup = reference_value_lookup(&expired_session);
+        expired_handoff_state.expires_at = now + 100;
+        assert_eq!(
+            issue_sso_handoff(
+                &mut connection,
+                &expired_session,
+                &expired_handoff,
+                &expired_handoff_state,
+            )
+            .await,
+            Err(RedisStateError::Expired)
+        );
+        assert!(!redis_exists(&mut connection, &handoff_key(&expired_handoff)).await);
+
+        let mut conflict_session_state = session();
+        conflict_session_state.expires_at = now + 120;
+        write_session(
+            &mut connection,
+            &conflict_session,
+            &conflict_session_state,
+            now,
+        )
+        .await
+        .unwrap();
+        let mut conflict_handoff_state = handoff(UsageStatus::Unused);
+        conflict_handoff_state.common_session_lookup = reference_value_lookup(&conflict_session);
+        conflict_handoff_state.expires_at = now + 100;
+        write_handoff(
+            &mut connection,
+            &conflict_handoff,
+            &conflict_handoff_state,
+            now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            issue_sso_handoff(
+                &mut connection,
+                &conflict_session,
+                &conflict_handoff,
+                &conflict_handoff_state,
+            )
+            .await,
+            Err(RedisStateError::KeyConflict)
+        );
+
+        let mut initial_session = session();
+        initial_session.expires_at = now + 120;
+        let mut initial_handoff = handoff(UsageStatus::Unused);
+        initial_handoff.common_session_lookup = reference_value_lookup(&initial_new_session);
+        initial_handoff.expires_at = now + 100;
+        write_session(&mut connection, &initial_new_session, &initial_session, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            create_session_and_handoff(
+                &mut connection,
+                &initial_new_session,
+                &initial_session,
+                &initial_new_handoff,
+                &initial_handoff,
+            )
+            .await,
+            Err(RedisStateError::KeyConflict)
+        );
+        assert!(!redis_exists(&mut connection, &handoff_key(&initial_new_handoff)).await);
+
+        initial_handoff.common_session_lookup = reference_value_lookup(&initial_handoff_session);
+        write_handoff(&mut connection, &initial_new_handoff, &initial_handoff, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            create_session_and_handoff(
+                &mut connection,
+                &initial_handoff_session,
+                &initial_session,
+                &initial_new_handoff,
+                &initial_handoff,
+            )
+            .await,
+            Err(RedisStateError::KeyConflict)
+        );
+        assert!(!redis_exists(&mut connection, &session_key(&initial_handoff_session)).await);
+
+        let mut exchange_session_state = session();
+        exchange_session_state.expires_at = now + 120;
+        write_session(
+            &mut connection,
+            &exchange_session,
+            &exchange_session_state,
+            now,
+        )
+        .await
+        .unwrap();
+        let mut exchange_handoff_state = handoff(UsageStatus::Unused);
+        exchange_handoff_state.common_session_lookup = reference_value_lookup(&exchange_session);
+        exchange_handoff_state.expires_at = now + 100;
+        write_handoff(
+            &mut connection,
+            &exchange_handoff_reference,
+            &exchange_handoff_state,
+            now,
+        )
+        .await
+        .unwrap();
+        let exchange_key = handoff_key(&exchange_handoff_reference);
+        let exchange_session_key = session_key(&exchange_session);
+        assert_eq!(
+            exchange_handoff(
+                &mut connection,
+                &exchange_handoff_reference,
+                "other-service",
+                "challenge",
+            )
+            .await,
+            Err(RedisStateError::ServiceMismatch)
+        );
+        assert_eq!(redis_status(&mut connection, &exchange_key).await, "unused");
+        assert_eq!(
+            exchange_handoff(
+                &mut connection,
+                &exchange_handoff_reference,
+                "service",
+                "other-challenge",
+            )
+            .await,
+            Err(RedisStateError::ChallengeMismatch)
+        );
+        assert_eq!(redis_status(&mut connection, &exchange_key).await, "unused");
+
+        let mut missing_exchange_state = handoff(UsageStatus::Unused);
+        missing_exchange_state.common_session_lookup = reference_value_lookup(&missing_session);
+        missing_exchange_state.expires_at = now + 100;
+        write_handoff(
+            &mut connection,
+            &missing_exchange_handoff,
+            &missing_exchange_state,
+            now,
+        )
+        .await
+        .unwrap();
+        let missing_exchange_key = handoff_key(&missing_exchange_handoff);
+        assert_eq!(
+            exchange_handoff(
+                &mut connection,
+                &missing_exchange_handoff,
+                "service",
+                "challenge",
+            )
+            .await,
+            Err(RedisStateError::NotFound)
+        );
+        assert_eq!(
+            redis_status(&mut connection, &missing_exchange_key).await,
+            "unused"
+        );
+
+        let mut expired_exchange_session_state = session();
+        expired_exchange_session_state.expires_at = now + 120;
+        write_session(
+            &mut connection,
+            &expired_exchange_session,
+            &expired_exchange_session_state,
+            now,
+        )
+        .await
+        .unwrap();
+        set_hash_field(
+            &mut connection,
+            &session_key(&expired_exchange_session),
+            "expires_at",
+            (now - 1).to_string(),
+        )
+        .await;
+        let mut expired_exchange_handoff_state = handoff(UsageStatus::Unused);
+        expired_exchange_handoff_state.common_session_lookup =
+            reference_value_lookup(&expired_exchange_session);
+        expired_exchange_handoff_state.expires_at = now + 100;
+        write_handoff(
+            &mut connection,
+            &expired_exchange_handoff,
+            &expired_exchange_handoff_state,
+            now,
+        )
+        .await
+        .unwrap();
+        let expired_exchange_key = handoff_key(&expired_exchange_handoff);
+        assert_eq!(
+            exchange_handoff(
+                &mut connection,
+                &expired_exchange_handoff,
+                "service",
+                "challenge",
+            )
+            .await,
+            Err(RedisStateError::Expired)
+        );
+        assert_eq!(
+            redis_status(&mut connection, &expired_exchange_key).await,
+            "unused"
+        );
+
+        for (reference, field, value) in [
+            (&mismatch_user_handoff, "internal_user_id", "43"),
+            (&mismatch_auth_handoff, "authenticated_at", "102"),
+        ] {
+            write_handoff(&mut connection, reference, &exchange_handoff_state, now)
+                .await
+                .unwrap();
+            let key = handoff_key(reference);
+            set_hash_field(&mut connection, &key, field, value).await;
+            assert_eq!(
+                exchange_handoff(&mut connection, reference, "service", "challenge").await,
+                Err(RedisStateError::InvalidStoredState)
+            );
+            assert_eq!(redis_status(&mut connection, &key).await, "unused");
+        }
+
+        for (reference, field, value) in [
+            (&malformed_handoff, "unexpected", "value"),
+            (&range_handoff, "internal_user_id", "2147483648"),
+        ] {
+            write_handoff(&mut connection, reference, &exchange_handoff_state, now)
+                .await
+                .unwrap();
+            let key = handoff_key(reference);
+            let handoff_ttl = redis_expiretime(&mut connection, &key).await;
+            let session_ttl = redis_expiretime(&mut connection, &exchange_session_key).await;
+            set_hash_field(&mut connection, &key, field, value).await;
+            assert_eq!(
+                exchange_handoff(&mut connection, reference, "service", "challenge").await,
+                Err(RedisStateError::InvalidStoredState)
+            );
+            assert_eq!(redis_status(&mut connection, &key).await, "unused");
+            assert_eq!(redis_expiretime(&mut connection, &key).await, handoff_ttl);
+            assert_eq!(
+                redis_expiretime(&mut connection, &exchange_session_key).await,
+                session_ttl
+            );
+        }
+
+        write_handoff(&mut connection, &ttl_handoff, &exchange_handoff_state, now)
+            .await
+            .unwrap();
+        let ttl_handoff_key = handoff_key(&ttl_handoff);
+        redis::cmd("EXPIREAT")
+            .arg(&ttl_handoff_key)
+            .arg(now + 30)
+            .query_async::<()>(&mut connection)
+            .await
+            .unwrap();
+        assert_eq!(
+            exchange_handoff(&mut connection, &ttl_handoff, "service", "challenge").await,
+            Err(RedisStateError::InvalidStoredState)
+        );
+        assert_eq!(
+            redis_status(&mut connection, &ttl_handoff_key).await,
+            "unused"
+        );
+
+        let mut logout_state = logout();
+        logout_state.expires_at = now + 120;
+        let mut logout_session_state = session();
+        logout_session_state.expires_at = now + 120;
+        write_logout(&mut connection, &logout_csrf, &logout_state, now)
+            .await
+            .unwrap();
+        write_session(
+            &mut connection,
+            &logout_csrf_session,
+            &logout_session_state,
+            now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            complete_common_logout(
+                &mut connection,
+                &logout_csrf,
+                &logout_csrf_session,
+                "0".repeat(64).as_str(),
+            )
+            .await,
+            Err(RedisStateError::CsrfMismatch)
+        );
+        assert_eq!(
+            redis_status(&mut connection, &logout_key(&logout_csrf)).await,
+            "unused"
+        );
+        assert!(redis_exists(&mut connection, &session_key(&logout_csrf_session)).await);
+
+        write_logout(&mut connection, &logout_expired, &logout_state, now)
+            .await
+            .unwrap();
+        let logout_expired_key = logout_key(&logout_expired);
+        set_hash_field(
+            &mut connection,
+            &logout_expired_key,
+            "expires_at",
+            (now - 1).to_string(),
+        )
+        .await;
+        assert_eq!(
+            complete_common_logout(
+                &mut connection,
+                &logout_expired,
+                &logout_csrf_session,
+                &logout_state.csrf_lookup,
+            )
+            .await,
+            Err(RedisStateError::Expired)
+        );
+        assert!(!redis_exists(&mut connection, &logout_expired_key).await);
+
+        write_logout(&mut connection, &logout_absent_session, &logout_state, now)
+            .await
+            .unwrap();
+        assert_eq!(
+            complete_common_logout(
+                &mut connection,
+                &logout_absent_session,
+                &missing_session,
+                &logout_state.csrf_lookup,
+            )
+            .await,
+            Ok(logout_state.logout_return_uri.clone())
+        );
+        let logout_absent_key = logout_key(&logout_absent_session);
+        assert!(redis_exists(&mut connection, &logout_absent_key).await);
+        assert_eq!(
+            redis_status(&mut connection, &logout_absent_key).await,
+            "used"
+        );
+
+        for reference in cleanup_references {
+            for key in [
+                external_key(reference),
+                session_key(reference),
+                handoff_key(reference),
+                logout_key(reference),
+            ] {
+                redis::cmd("DEL")
+                    .arg(key)
+                    .query_async::<()>(&mut connection)
+                    .await
+                    .unwrap();
+            }
         }
     }
 }
