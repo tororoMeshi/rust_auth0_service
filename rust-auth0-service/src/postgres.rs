@@ -76,6 +76,33 @@ pub(crate) async fn lookup_login_callback_uri(
         .map_err(|_| PostgresAuthError::DatabaseFailure)
 }
 
+pub(crate) async fn lookup_logout_return_uri(
+    pool: &PgPool,
+    service_id: &str,
+) -> Result<String, PostgresAuthError> {
+    let row = sqlx::query(
+        "SELECT is_enabled, logout_return_uri
+         FROM public.registered_web_services
+         WHERE service_id = $1",
+    )
+    .bind(service_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| PostgresAuthError::DatabaseFailure)?;
+
+    let Some(row) = row else {
+        return Err(PostgresAuthError::ServiceNotFound);
+    };
+    let is_enabled: bool = row
+        .try_get("is_enabled")
+        .map_err(|_| PostgresAuthError::DatabaseFailure)?;
+    if !is_enabled {
+        return Err(PostgresAuthError::ServiceDisabled);
+    }
+    row.try_get("logout_return_uri")
+        .map_err(|_| PostgresAuthError::DatabaseFailure)
+}
+
 pub(crate) async fn read_internal_user_enabled(
     pool: &PgPool,
     internal_user_id: i32,
@@ -625,5 +652,31 @@ mod tests {
         assert_eq!(after, before);
 
         cleanup_identity(&pool, &provider).await;
+    }
+
+    #[actix_web::test]
+    #[ignore = "requires disposable PostgreSQL"]
+    async fn logout_return_uri_lookup_cases() {
+        let pool = test_pool().await;
+        let enabled = format!("t12logoutenabled{}", test_suffix());
+        let disabled = format!("t12logoutdisabled{}", test_suffix());
+        insert_service(&pool, &enabled, true, "secret").await;
+        insert_service(&pool, &disabled, false, "secret").await;
+
+        assert_eq!(
+            lookup_logout_return_uri(&pool, &enabled).await,
+            Ok("https://logout.example.test".to_owned())
+        );
+        assert_eq!(
+            lookup_logout_return_uri(&pool, "t12logoutmissing").await,
+            Err(PostgresAuthError::ServiceNotFound)
+        );
+        assert_eq!(
+            lookup_logout_return_uri(&pool, &disabled).await,
+            Err(PostgresAuthError::ServiceDisabled)
+        );
+
+        cleanup_service(&pool, &enabled).await;
+        cleanup_service(&pool, &disabled).await;
     }
 }

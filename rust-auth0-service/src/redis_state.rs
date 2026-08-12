@@ -206,6 +206,14 @@ end
 local function lookup(value)
   return value ~= false and string.match(value, "^[0-9a-f][0-9a-f]*$") ~= nil and string.len(value) == 64
 end
+local function fixed_work_equal_lookup(a, b)
+  if not lookup(a) or not lookup(b) then return false end
+  local diff = 0
+  for i = 1, 64 do
+    diff = bit.bor(diff, bit.bxor(string.byte(a, i), string.byte(b, i)))
+  end
+  return diff == 0
+end
 if redis.call("EXISTS", KEYS[1]) == 0 then return {1} end
 if redis.call("TYPE", KEYS[1]).ok ~= "hash" then return invalid() end
 if redis.call("HLEN", KEYS[1]) ~= 6 then return invalid() end
@@ -222,7 +230,8 @@ if now >= tonumber(expires_at) then redis.call("DEL", KEYS[1]); return {2} end
 if redis.call("EXPIRETIME", KEYS[1]) ~= tonumber(expires_at) then return invalid() end
 if status == "used" then return {5} end
 if status ~= "unused" then return invalid() end
-if csrf_lookup ~= ARGV[1] then return {8} end
+if not lookup(ARGV[1]) then return {8} end
+if not fixed_work_equal_lookup(csrf_lookup, ARGV[1]) then return {8} end
 redis.call("HSET", KEYS[1], "status", "used")
 redis.call("DEL", KEYS[2])
 return {0, return_uri}
@@ -2207,5 +2216,118 @@ mod tests {
                     .unwrap();
             }
         }
+    }
+
+    #[actix_web::test]
+    #[ignore = "requires AUTH_FOUNDATION_TEST_REDIS_URL and a disposable Redis 7 instance"]
+    async fn t12_common_logout_csrf_full_length_regression() {
+        let redis_url = std::env::var("AUTH_FOUNDATION_TEST_REDIS_URL")
+            .expect("AUTH_FOUNDATION_TEST_REDIS_URL must be set");
+        let client = redis::Client::open(redis_url).expect("test Redis URL must be valid");
+        let mut connection = client
+            .get_multiplexed_async_connection()
+            .await
+            .expect("connect disposable Redis");
+        let now: u64 = redis::cmd("TIME")
+            .query_async::<(u64, u64)>(&mut connection)
+            .await
+            .expect("read Redis time")
+            .0;
+        let suffix = now.to_string();
+        let session_reference = format!("t12-csrf-session-{suffix}");
+        let logout_reference = format!("t12-csrf-logout-{suffix}");
+        let session = CommonSession {
+            internal_user_id: 42,
+            authenticated_at: now - 1,
+            created_at: now - 2,
+            expires_at: now + 120,
+        };
+        let csrf_lookup = "a".repeat(64);
+        let logout = CommonLogoutTransaction {
+            service_id: "service".to_owned(),
+            logout_return_uri: "https://service.example/logout".to_owned(),
+            csrf_lookup: csrf_lookup.clone(),
+            created_at: now,
+            expires_at: now + 120,
+            status: UsageStatus::Unused,
+        };
+        let session_key = session_key(&session_reference);
+        let logout_state_key = logout_key(&logout_reference);
+        let _: () = redis::cmd("DEL")
+            .arg(&session_key)
+            .arg(&logout_state_key)
+            .query_async(&mut connection)
+            .await
+            .expect("clear test state");
+        write_session(&mut connection, &session_reference, &session, now)
+            .await
+            .expect("write CommonSession");
+        write_logout(&mut connection, &logout_reference, &logout, now)
+            .await
+            .expect("write logout transaction");
+
+        for mismatch in [
+            format!("b{}", "a".repeat(63)),
+            format!("{}b{}", "a".repeat(31), "a".repeat(32)),
+            format!("{}b", "a".repeat(63)),
+        ] {
+            assert_eq!(
+                complete_common_logout(
+                    &mut connection,
+                    &logout_reference,
+                    &session_reference,
+                    &mismatch,
+                )
+                .await,
+                Err(RedisStateError::CsrfMismatch)
+            );
+            assert_eq!(
+                redis_status(&mut connection, &logout_state_key).await,
+                "unused"
+            );
+            assert!(redis_exists(&mut connection, &session_key).await);
+        }
+        assert_eq!(
+            complete_common_logout(
+                &mut connection,
+                &logout_reference,
+                &session_reference,
+                &csrf_lookup,
+            )
+            .await,
+            Ok(logout.logout_return_uri.clone())
+        );
+
+        let invalid_reference = format!("t12-csrf-invalid-{suffix}");
+        let invalid_key = logout_key(&invalid_reference);
+        write_logout(&mut connection, &invalid_reference, &logout, now)
+            .await
+            .expect("write invalid logout transaction");
+        redis::cmd("HSET")
+            .arg(&invalid_key)
+            .arg("csrf_lookup")
+            .arg("a".repeat(63))
+            .query_async::<()>(&mut connection)
+            .await
+            .expect("corrupt csrf lookup");
+        assert_eq!(
+            complete_common_logout(
+                &mut connection,
+                &invalid_reference,
+                &session_reference,
+                &csrf_lookup,
+            )
+            .await,
+            Err(RedisStateError::InvalidStoredState)
+        );
+        assert_eq!(redis_status(&mut connection, &invalid_key).await, "unused");
+
+        let _: () = redis::cmd("DEL")
+            .arg(&session_key)
+            .arg(&logout_state_key)
+            .arg(&invalid_key)
+            .query_async(&mut connection)
+            .await
+            .expect("clean test state");
     }
 }
