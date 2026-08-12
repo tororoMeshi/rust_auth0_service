@@ -49,6 +49,54 @@ pub(crate) async fn authenticate_service(
     })
 }
 
+pub(crate) async fn lookup_login_callback_uri(
+    pool: &PgPool,
+    service_id: &str,
+) -> Result<String, PostgresAuthError> {
+    let row = sqlx::query(
+        "SELECT is_enabled, login_callback_uri
+         FROM public.registered_web_services
+         WHERE service_id = $1",
+    )
+    .bind(service_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| PostgresAuthError::DatabaseFailure)?;
+
+    let Some(row) = row else {
+        return Err(PostgresAuthError::ServiceNotFound);
+    };
+    let is_enabled: bool = row
+        .try_get("is_enabled")
+        .map_err(|_| PostgresAuthError::DatabaseFailure)?;
+    if !is_enabled {
+        return Err(PostgresAuthError::ServiceDisabled);
+    }
+    row.try_get("login_callback_uri")
+        .map_err(|_| PostgresAuthError::DatabaseFailure)
+}
+
+pub(crate) async fn read_internal_user_enabled(
+    pool: &PgPool,
+    internal_user_id: i32,
+) -> Result<Option<bool>, PostgresAuthError> {
+    let row = sqlx::query(
+        "SELECT is_enabled
+         FROM public.internal_users
+         WHERE internal_user_id = $1",
+    )
+    .bind(internal_user_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| PostgresAuthError::DatabaseFailure)?;
+
+    row.map(|row| {
+        row.try_get("is_enabled")
+            .map_err(|_| PostgresAuthError::DatabaseFailure)
+    })
+    .transpose()
+}
+
 pub(crate) async fn resolve_external_identity(
     pool: &PgPool,
     provider: &str,
@@ -376,6 +424,68 @@ mod tests {
         );
 
         cleanup_service(&pool, &service_id).await;
+    }
+
+    #[actix_web::test]
+    #[ignore = "requires disposable PostgreSQL"]
+    async fn login_callback_lookup_cases() {
+        let pool = test_pool().await;
+        let service_id = format!("t10login{}", test_suffix());
+        insert_service(&pool, &service_id, true, "secret").await;
+
+        assert_eq!(
+            lookup_login_callback_uri(&pool, &service_id).await,
+            Ok("https://callback.example.test".to_owned())
+        );
+        assert_eq!(
+            lookup_login_callback_uri(&pool, "t10missing").await,
+            Err(PostgresAuthError::ServiceNotFound)
+        );
+        sqlx::query(
+            "UPDATE public.registered_web_services SET is_enabled = false WHERE service_id = $1",
+        )
+        .bind(&service_id)
+        .execute(&pool)
+        .await
+        .expect("disable service");
+        assert_eq!(
+            lookup_login_callback_uri(&pool, &service_id).await,
+            Err(PostgresAuthError::ServiceDisabled)
+        );
+        cleanup_service(&pool, &service_id).await;
+
+        pool.close().await;
+        assert_eq!(
+            lookup_login_callback_uri(&pool, "t10closed").await,
+            Err(PostgresAuthError::DatabaseFailure)
+        );
+    }
+
+    #[actix_web::test]
+    #[ignore = "requires disposable PostgreSQL"]
+    async fn internal_user_enabled_read_cases() {
+        let pool = test_pool().await;
+        let enabled: i32 = sqlx::query(
+            "INSERT INTO public.internal_users DEFAULT VALUES RETURNING internal_user_id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("insert enabled user")
+        .try_get("internal_user_id")
+        .expect("user id");
+        let disabled: i32 = sqlx::query("INSERT INTO public.internal_users (is_enabled) VALUES (false) RETURNING internal_user_id")
+            .fetch_one(&pool).await.expect("insert disabled user").try_get("internal_user_id").expect("user id");
+        assert_eq!(
+            read_internal_user_enabled(&pool, enabled).await,
+            Ok(Some(true))
+        );
+        assert_eq!(
+            read_internal_user_enabled(&pool, disabled).await,
+            Ok(Some(false))
+        );
+        assert_eq!(read_internal_user_enabled(&pool, -1).await, Ok(None));
+        sqlx::query("DELETE FROM public.internal_users WHERE internal_user_id = $1 OR internal_user_id = $2")
+            .bind(enabled).bind(disabled).execute(&pool).await.expect("clean up users");
     }
 
     #[actix_web::test]
