@@ -90,3 +90,7 @@ Secretは、Google client secret、PostgreSQL credential、Redis credentialが�
 ## 9. 完了判定
 
 すべての期限、上限、Cookie属性、CSRF比較、入力上限が実装・設定・検証で一致していること。開発オリジンに `localhost:8080` を残さず、`http://localhost:5173` を使用すること。共通ログアウトとportalローカルログアウトのCSRF方式を混同しないこと。T01は稼働PodのimageIDからdigestを取得し、ロールバック参照として固定済みとする。T21/T25はdigest指定でレジストリからpullし、旧構成を再配備できることを実証する。
+
+## 10. 承認
+
+本書の現行内容を、Gate Aの実装定数表として人間が承認した。
