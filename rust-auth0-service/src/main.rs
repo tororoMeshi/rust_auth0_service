@@ -25,29 +25,35 @@ use oauth2::{
     Scope, TokenUrl,
 };
 use rand::{distributions::Alphanumeric, Rng};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
 use std::{env, io, time::SystemTime};
 
 use crate::auth_foundation::{
     checked_expires_at, generate_reference_value, reference_value_lookup, unix_seconds,
-    validate_fixed_reference_value, validate_max_bytes, validate_service_id,
-    SERVICE_STATE_MAX_BYTES,
+    validate_fixed_reference_value, validate_max_bytes, validate_service_id, EmailVerification,
+    NormalizedExternalIdentity, OAUTH_CODE_MAX_BYTES, SERVICE_STATE_MAX_BYTES,
 };
-use crate::postgres::{lookup_login_callback_uri, read_internal_user_enabled, PostgresAuthError};
+use crate::postgres::{
+    lookup_login_callback_uri, read_internal_user_enabled, resolve_external_identity,
+    PostgresAuthError,
+};
 use crate::redis_state::{
-    issue_sso_handoff, read_session, write_external, AuthenticationHandoff,
-    ExternalAuthTransaction, ExternalStatus, RedisStateError, UsageStatus,
-    AUTHENTICATION_HANDOFF_TTL_SECONDS, EXTERNAL_AUTH_TRANSACTION_TTL_SECONDS,
+    claim_external_callback, create_session_and_handoff, issue_sso_handoff, read_session,
+    write_external, AuthenticationHandoff, CommonSession, ExternalAuthTransaction, ExternalStatus,
+    RedisStateError, UsageStatus, AUTHENTICATION_HANDOFF_TTL_SECONDS, COMMON_SESSION_TTL_SECONDS,
+    EXTERNAL_AUTH_TRANSACTION_TTL_SECONDS,
 };
 
 const AUTH_SESSION_COOKIE_NAME: &str = "__Host-auth_session";
+const GOOGLE_AUTHORIZATION_URL: &str = "https://accounts.google.com/o/oauth2/auth";
+const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+const GOOGLE_USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v1/userinfo?alt=json";
 
 #[derive(Clone)]
 struct AppConfig {
     google_client_id: String,
-    google_client_secret: String,
     google_redirect_uri: String,
     uniauth_url: String,
 }
@@ -56,6 +62,11 @@ struct AppConfig {
 struct GoogleAuthorizationConfig {
     client_id: String,
     redirect_uri: RedirectUrl,
+}
+
+struct GoogleCallbackConfig {
+    oauth_client: BasicClient,
+    userinfo_url: reqwest::Url,
 }
 
 struct AuthFoundationConfig {
@@ -285,7 +296,7 @@ async fn start_google_login(
     let authorization_url = BasicClient::new(
         ClientId::new(google_config.client_id.clone()),
         None,
-        AuthUrl::new("https://accounts.google.com/o/oauth2/auth".to_owned()).expect("valid URL"),
+        AuthUrl::new(GOOGLE_AUTHORIZATION_URL.to_owned()).expect("valid URL"),
         None,
     )
     .set_redirect_uri(google_config.redirect_uri.clone())
@@ -485,120 +496,203 @@ struct CallbackQuery {
     state: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct UserInfo {
+#[derive(Debug, Deserialize)]
+struct GoogleUserInfo {
     id: String,
-    email: String,
-    verified_email: bool,
-    picture: String,
+    email: Option<String>,
+    verified_email: Option<bool>,
+    name: Option<String>,
+    picture: Option<String>,
+}
+
+fn normalize_google_user_info(user_info: GoogleUserInfo) -> Result<NormalizedExternalIdentity, ()> {
+    let identity = NormalizedExternalIdentity {
+        provider: "google".to_owned(),
+        subject: user_info.id,
+        email: user_info.email.filter(|value| !value.is_empty()),
+        email_verification: match user_info.verified_email {
+            Some(true) => EmailVerification::Verified,
+            Some(false) => EmailVerification::Unverified,
+            None => EmailVerification::Unknown,
+        },
+        display_name: user_info.name.filter(|value| !value.trim().is_empty()),
+        picture_url: user_info.picture.filter(|value| !value.is_empty()),
+    };
+    identity.validate().map_err(|_| ())?;
+    Ok(identity)
 }
 
 #[get("/auth/google/callback")]
 async fn google_auth_callback(
-    session: Session,
     query: web::Query<CallbackQuery>,
-    config: web::Data<AppConfig>,
+    postgres_pool: web::Data<PgPool>,
+    redis_connection: web::Data<redis::aio::MultiplexedConnection>,
+    google_config: web::Data<GoogleCallbackConfig>,
 ) -> HttpResponse {
-    // セッションに保存された state と受信した state の比較（CSRF 対策）
-    let stored_state: Option<String> = match session.get("oauth_state") {
+    let query = query.into_inner();
+    if query.code.is_empty()
+        || validate_max_bytes(&query.code, OAUTH_CODE_MAX_BYTES).is_err()
+        || validate_fixed_reference_value(&query.state).is_err()
+    {
+        error!("authentication callback input rejected");
+        return HttpResponse::BadRequest().finish();
+    }
+
+    let mut connection = redis_connection.get_ref().clone();
+    let transaction = match claim_external_callback(&mut connection, &query.state).await {
+        Ok(value) => value,
+        Err(
+            RedisStateError::NotFound | RedisStateError::Expired | RedisStateError::AlreadyClaimed,
+        ) => {
+            error!("authentication callback state unavailable");
+            return HttpResponse::BadRequest().finish();
+        }
+        Err(_) => {
+            error!("authentication Redis state unavailable");
+            return HttpResponse::ServiceUnavailable().finish();
+        }
+    };
+
+    let callback_uri =
+        match lookup_login_callback_uri(postgres_pool.get_ref(), &transaction.service_id).await {
+            Ok(value) => value,
+            Err(PostgresAuthError::ServiceNotFound | PostgresAuthError::ServiceDisabled) => {
+                return HttpResponse::Forbidden().finish();
+            }
+            Err(_) => {
+                error!("authentication database unavailable");
+                return HttpResponse::ServiceUnavailable().finish();
+            }
+        };
+    let callback_url = match valid_callback_url(&callback_uri) {
+        Some(value) => value,
+        None => {
+            error!("registered login callback URI is invalid");
+            return HttpResponse::InternalServerError().finish();
+        }
+    };
+
+    let token = match google_config
+        .oauth_client
+        .exchange_code(AuthorizationCode::new(query.code))
+        .request_async(async_http_client)
+        .await
+    {
         Ok(value) => value,
         Err(_) => {
-            error!("Failed to read OAuth request data from legacy session");
-            return HttpResponse::InternalServerError()
-                .body("Internal server error: cannot get oauth_state");
-        }
-    };
-    if stored_state.as_deref() != Some(query.state.as_str()) {
-        error!("OAuth request validation failed");
-        return HttpResponse::BadRequest()
-            .body("Invalid state parameter. Please try logging in again.");
-    }
-
-    // Google からアクセストークンを取得
-    let auth_url = match AuthUrl::new("https://accounts.google.com/o/oauth2/auth".to_string()) {
-        Ok(url) => url,
-        Err(_) => {
-            error!("Google authorization endpoint configuration is invalid");
-            return HttpResponse::InternalServerError()
-                .body("Internal server error: invalid auth URL");
-        }
-    };
-    let token_url = match TokenUrl::new("https://oauth2.googleapis.com/token".to_string()) {
-        Ok(url) => url,
-        Err(_) => {
-            error!("Google token endpoint configuration is invalid");
-            return HttpResponse::InternalServerError()
-                .body("Internal server error: invalid token URL");
-        }
-    };
-    let redirect_uri = match RedirectUrl::new(config.google_redirect_uri.clone()) {
-        Ok(url) => url,
-        Err(_) => {
-            error!("Google redirect URI configuration is invalid");
-            return HttpResponse::InternalServerError()
-                .body("Internal server error: invalid redirect URI");
-        }
-    };
-
-    let client = BasicClient::new(
-        ClientId::new(config.google_client_id.clone()),
-        Some(ClientSecret::new(config.google_client_secret.clone())),
-        auth_url,
-        Some(token_url),
-    )
-    .set_redirect_uri(redirect_uri);
-
-    let token_result = client
-        .exchange_code(AuthorizationCode::new(query.code.clone()))
-        .request_async(async_http_client)
-        .await;
-
-    match token_result {
-        Ok(token) => {
-            let access_token = token.access_token().secret().clone();
-            match get_google_user_info(&access_token).await {
-                Ok(user_info) => {
-                    match request_session_from_uniauth(&config.uniauth_url, &user_info).await {
-                        Ok(session_data) => {
-                            // セッションに保存されたリダイレクト先を取得（デフォルトは "/"）
-                            let raw_redirect: String = session
-                                .get("redirect")
-                                .unwrap_or_else(|_| Some(post_login_redirect()))
-                                .unwrap_or_else(post_login_redirect);
-                            let redirect_url = resolve_redirect_url(&raw_redirect);
-
-                            let session_cookie =
-                                build_auth_cookie("session_id", session_data.session_id.clone());
-                            let jwt_cookie = build_auth_cookie("jwt", session_data.token.clone());
-
-                            info!("Redirecting user to: {}", redirect_url);
-
-                            HttpResponse::Found()
-                                .cookie(session_cookie)
-                                .cookie(jwt_cookie)
-                                .append_header(("Location", redirect_url))
-                                .finish()
-                        }
-                        Err(_) => {
-                            error!("legacy uniauth request failed");
-                            HttpResponse::InternalServerError()
-                                .body("Failed to generate session. Please try again later.")
-                        }
-                    }
-                }
-                Err(_) => {
-                    error!("Google user info request failed");
-                    HttpResponse::InternalServerError()
-                        .body("Failed to get user info. Please try again later.")
-                }
-            }
-        }
-        Err(_) => {
             error!("Google token exchange failed");
-            HttpResponse::BadRequest()
-                .body("Error exchanging code. Please retry the login process.")
+            return HttpResponse::BadGateway().finish();
         }
+    };
+    let response = match reqwest::Client::new()
+        .get(google_config.userinfo_url.clone())
+        .bearer_auth(token.access_token().secret())
+        .send()
+        .await
+    {
+        Ok(value) if value.status().is_success() => value,
+        _ => {
+            error!("Google user info request failed");
+            return HttpResponse::BadGateway().finish();
+        }
+    };
+    let user_info = match response.json::<GoogleUserInfo>().await {
+        Ok(value) => value,
+        Err(_) => {
+            error!("Google user info response invalid");
+            return HttpResponse::BadGateway().finish();
+        }
+    };
+    let identity = match normalize_google_user_info(user_info) {
+        Ok(value) => value,
+        Err(()) => {
+            error!("Google identity response invalid");
+            return HttpResponse::BadGateway().finish();
+        }
+    };
+    let now = match unix_seconds(SystemTime::now()) {
+        Ok(value) => value,
+        Err(_) => return HttpResponse::InternalServerError().finish(),
+    };
+    let internal_user_id = match resolve_external_identity(
+        postgres_pool.get_ref(),
+        &identity.provider,
+        &identity.subject,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(PostgresAuthError::UserDisabled) => return HttpResponse::Forbidden().finish(),
+        Err(PostgresAuthError::IdentityInconsistent) => {
+            return HttpResponse::InternalServerError().finish()
+        }
+        Err(_) => {
+            error!("authentication database unavailable");
+            return HttpResponse::ServiceUnavailable().finish();
+        }
+    };
+    let common_session_reference = match generate_reference_value() {
+        Ok(value) => value,
+        Err(_) => return HttpResponse::ServiceUnavailable().finish(),
+    };
+    let handoff_reference = match generate_reference_value() {
+        Ok(value) => value,
+        Err(_) => return HttpResponse::ServiceUnavailable().finish(),
+    };
+    let session_expires_at = match checked_expires_at(now, COMMON_SESSION_TTL_SECONDS) {
+        Ok(value) => value,
+        Err(_) => return HttpResponse::InternalServerError().finish(),
+    };
+    let handoff_expires_at = match checked_expires_at(now, AUTHENTICATION_HANDOFF_TTL_SECONDS) {
+        Ok(value) => value,
+        Err(_) => return HttpResponse::InternalServerError().finish(),
+    };
+    let session = CommonSession {
+        internal_user_id,
+        authenticated_at: now,
+        created_at: now,
+        expires_at: session_expires_at,
+    };
+    let handoff = AuthenticationHandoff {
+        service_id: transaction.service_id,
+        internal_user_id,
+        common_session_lookup: reference_value_lookup(&common_session_reference),
+        code_challenge: transaction.handoff_code_challenge,
+        authenticated_at: now,
+        issued_at: now,
+        expires_at: handoff_expires_at,
+        status: UsageStatus::Unused,
+    };
+    let mut callback_url = callback_url;
+    callback_url.set_query(None);
+    callback_url
+        .query_pairs_mut()
+        .append_pair("code", &handoff_reference)
+        .append_pair("state", &transaction.service_state);
+    let location = callback_url.to_string();
+    if create_session_and_handoff(
+        &mut connection,
+        &common_session_reference,
+        &session,
+        &handoff_reference,
+        &handoff,
+    )
+    .await
+    .is_err()
+    {
+        error!("authentication Redis state unavailable");
+        return HttpResponse::ServiceUnavailable().finish();
     }
+    let cookie = Cookie::build(AUTH_SESSION_COOKIE_NAME, common_session_reference)
+        .path("/")
+        .secure(true)
+        .http_only(true)
+        .same_site(SameSite::Lax)
+        .finish();
+    HttpResponse::Found()
+        .cookie(cookie)
+        .append_header((header::LOCATION, location))
+        .finish()
 }
 
 #[post("/auth/logout")]
@@ -613,44 +707,6 @@ async fn logout(req: HttpRequest, config: web::Data<AppConfig>) -> HttpResponse 
         .cookie(build_expired_auth_cookie("session_id"))
         .cookie(build_expired_auth_cookie("jwt"))
         .body("Logged out")
-}
-
-async fn get_google_user_info(access_token: &str) -> Result<UserInfo, reqwest::Error> {
-    let user_info_url = "https://www.googleapis.com/oauth2/v1/userinfo?alt=json";
-    let client = reqwest::Client::new();
-    let resp = client
-        .get(user_info_url)
-        .bearer_auth(access_token)
-        .send()
-        .await?;
-    if !resp.status().is_success() {
-        error!("Google userinfo returned error status: {}", resp.status());
-        return Err(resp.error_for_status().unwrap_err());
-    }
-    let user_info = resp.json::<UserInfo>().await?;
-    Ok(user_info)
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct UniauthResponse {
-    session_id: String,
-    token: String,
-    user: serde_json::Value,
-}
-
-async fn request_session_from_uniauth(
-    uniauth_url: &str,
-    user_info: &UserInfo,
-) -> Result<UniauthResponse, reqwest::Error> {
-    let url = format!("{}/upsert_and_token", uniauth_url);
-    let client = reqwest::Client::new();
-    let resp = client.post(&url).json(user_info).send().await?;
-    if !resp.status().is_success() {
-        error!("Uniauth returned error status: {}", resp.status());
-        return Err(resp.error_for_status().unwrap_err());
-    }
-    let session_data = resp.json::<UniauthResponse>().await?;
-    Ok(session_data)
 }
 
 async fn request_logout_from_uniauth(
@@ -717,7 +773,6 @@ async fn main() -> std::io::Result<()> {
 
     let config = AppConfig {
         google_client_id: auth_foundation_config.google_client_id.clone(),
-        google_client_secret: auth_foundation_config.google_client_secret.clone(),
         google_redirect_uri: auth_foundation_config.google_redirect_uri.clone(),
         uniauth_url: env::var("UNIAUTH_URL").unwrap_or_else(|_| "http://uniauth:8081".to_string()),
     };
@@ -731,6 +786,25 @@ async fn main() -> std::io::Result<()> {
                 )
             })?,
     };
+    let google_callback_config = web::Data::new(GoogleCallbackConfig {
+        oauth_client: BasicClient::new(
+            ClientId::new(auth_foundation_config.google_client_id.clone()),
+            Some(ClientSecret::new(
+                auth_foundation_config.google_client_secret.clone(),
+            )),
+            AuthUrl::new(GOOGLE_AUTHORIZATION_URL.to_owned()).expect("valid URL"),
+            Some(TokenUrl::new(GOOGLE_TOKEN_URL.to_owned()).expect("valid URL")),
+        )
+        .set_redirect_uri(
+            RedirectUrl::new(auth_foundation_config.google_redirect_uri.clone()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "GOOGLE_REDIRECT_URI must be a valid URL",
+                )
+            })?,
+        ),
+        userinfo_url: reqwest::Url::parse(GOOGLE_USERINFO_URL).expect("valid URL"),
+    });
 
     let allowed_redirect_origins = allowed_redirect_origins();
     let post_login_redirect = post_login_redirect();
@@ -769,6 +843,7 @@ async fn main() -> std::io::Result<()> {
             .wrap(cors)
             .app_data(web::Data::new(config.clone()))
             .app_data(web::Data::new(google_authorization_config.clone()))
+            .app_data(google_callback_config.clone())
             .app_data(web::Data::new(postgres_pool.clone()))
             .app_data(web::Data::new(redis_connection.clone()))
             .app_data(web::Data::new(redis_store.clone()))
@@ -803,6 +878,92 @@ mod tests {
                 "{parameter}&service_id=service&state=state&code_challenge={challenge}&code_challenge_method=S256"
             );
             assert!(web::Query::<LoginQuery>::from_query(&query).is_err());
+        }
+    }
+
+    #[test]
+    fn google_user_info_normalization_preserves_optional_identity_metadata() {
+        let verified = normalize_google_user_info(GoogleUserInfo {
+            id: "google-subject".to_owned(),
+            email: Some("person@example.test".to_owned()),
+            verified_email: Some(true),
+            name: Some("Display Name".to_owned()),
+            picture: None,
+        })
+        .expect("valid identity");
+        assert_eq!(verified.provider, "google");
+        assert_eq!(verified.subject, "google-subject");
+        assert_eq!(verified.email.as_deref(), Some("person@example.test"));
+        assert_eq!(verified.email_verification, EmailVerification::Verified);
+        assert_eq!(verified.picture_url, None);
+        assert_eq!(verified.display_name.as_deref(), Some("Display Name"));
+
+        for (verified_email, expected) in [
+            (Some(false), EmailVerification::Unverified),
+            (None, EmailVerification::Unknown),
+        ] {
+            let identity = normalize_google_user_info(GoogleUserInfo {
+                id: "google-subject".to_owned(),
+                email: None,
+                verified_email,
+                name: None,
+                picture: Some(String::new()),
+            })
+            .expect("valid identity");
+            assert_eq!(identity.email, None);
+            assert_eq!(identity.email_verification, expected);
+            assert_eq!(identity.picture_url, None);
+            assert_eq!(identity.display_name, None);
+        }
+
+        let empty_name = normalize_google_user_info(GoogleUserInfo {
+            id: "google-subject".to_owned(),
+            email: None,
+            verified_email: None,
+            name: Some(String::new()),
+            picture: None,
+        })
+        .expect("valid identity");
+        assert_eq!(empty_name.display_name, None);
+
+        let whitespace_only_name = normalize_google_user_info(GoogleUserInfo {
+            id: "google-subject".to_owned(),
+            email: None,
+            verified_email: None,
+            name: Some("   ".to_owned()),
+            picture: None,
+        })
+        .expect("valid identity");
+        assert_eq!(whitespace_only_name.display_name, None);
+
+        let surrounding_whitespace_name = normalize_google_user_info(GoogleUserInfo {
+            id: "google-subject".to_owned(),
+            email: None,
+            verified_email: None,
+            name: Some(" Alice Example ".to_owned()),
+            picture: None,
+        })
+        .expect("valid identity");
+        assert_eq!(
+            surrounding_whitespace_name.display_name.as_deref(),
+            Some(" Alice Example ")
+        );
+    }
+
+    #[test]
+    fn google_user_info_normalization_rejects_empty_or_oversized_subject() {
+        for id in [
+            String::new(),
+            "s".repeat(crate::auth_foundation::SUBJECT_MAX_BYTES + 1),
+        ] {
+            assert!(normalize_google_user_info(GoogleUserInfo {
+                id,
+                email: None,
+                verified_email: None,
+                name: None,
+                picture: None,
+            })
+            .is_err());
         }
     }
 
@@ -1247,6 +1408,634 @@ mod tests {
             .expect("remove disabled service");
         sqlx::query("DELETE FROM public.internal_users WHERE internal_user_id = $1 OR internal_user_id = $2")
             .bind(enabled_user).bind(disabled_user).execute(&pool).await.expect("remove users");
+    }
+
+    #[actix_web::test]
+    #[ignore = "requires disposable PostgreSQL and Redis 7"]
+    async fn t11_google_callback_http_integration_cases() {
+        use crate::redis_state::{read_external, read_handoff, read_session};
+        use sqlx::postgres::PgPoolOptions;
+        use sqlx::Row;
+        use std::net::TcpListener;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        #[derive(Clone)]
+        struct FakeGoogle {
+            token_calls: Arc<AtomicUsize>,
+            userinfo_calls: Arc<AtomicUsize>,
+            mode: Arc<AtomicUsize>,
+        }
+
+        async fn token(google: web::Data<FakeGoogle>) -> HttpResponse {
+            google.token_calls.fetch_add(1, Ordering::SeqCst);
+            if google.mode.load(Ordering::SeqCst) == 1 {
+                HttpResponse::BadGateway().finish()
+            } else {
+                HttpResponse::Ok().json(serde_json::json!({
+                    "access_token": "test-access-token",
+                    "token_type": "Bearer",
+                    "expires_in": 3600
+                }))
+            }
+        }
+
+        async fn userinfo(google: web::Data<FakeGoogle>) -> HttpResponse {
+            google.userinfo_calls.fetch_add(1, Ordering::SeqCst);
+            match google.mode.load(Ordering::SeqCst) {
+                2 => HttpResponse::BadGateway().finish(),
+                3 => HttpResponse::Ok().json(serde_json::json!({"id": ""})),
+                4 => HttpResponse::Ok().json(serde_json::json!({"id": "google-subject-disabled"})),
+                _ => HttpResponse::Ok().json(serde_json::json!({
+                    "id": "google-subject-new",
+                    "email": "user@example.test",
+                    "verified_email": true,
+                    "name": "Google User",
+                    "picture": "https://example.test/picture.png"
+                })),
+            }
+        }
+
+        async fn insert_service(pool: &PgPool, service_id: &str, enabled: bool) {
+            sqlx::query(
+                "INSERT INTO public.registered_web_services (service_id, is_enabled, login_callback_uri, logout_return_uri, service_secret_sha256) \
+                 VALUES ($1, $2, 'https://service.example.test/login?existing=value', 'https://service.example.test/logout', $3)",
+            )
+            .bind(service_id)
+            .bind(enabled)
+            .bind(vec![7_u8; 32])
+            .execute(pool)
+            .await
+            .expect("insert service");
+        }
+
+        async fn insert_external(
+            connection: &mut redis::aio::MultiplexedConnection,
+            reference: &str,
+            service_id: &str,
+            service_state: &str,
+        ) {
+            let now = unix_seconds(SystemTime::now()).expect("clock");
+            write_external(
+                connection,
+                reference,
+                &ExternalAuthTransaction {
+                    service_id: service_id.to_owned(),
+                    service_state: service_state.to_owned(),
+                    handoff_code_challenge: "A".repeat(43),
+                    provider: "google".to_owned(),
+                    provider_verification_data: String::new(),
+                    created_at: now,
+                    expires_at: now + 600,
+                    status: ExternalStatus::Waiting,
+                },
+                now,
+            )
+            .await
+            .expect("write external transaction");
+        }
+
+        async fn redis_key_count(
+            connection: &mut redis::aio::MultiplexedConnection,
+            pattern: &str,
+        ) -> usize {
+            redis::cmd("KEYS")
+                .arg(pattern)
+                .query_async::<Vec<String>>(connection)
+                .await
+                .expect("count Redis state")
+                .len()
+        }
+
+        fn callback_uri(code: &str, state: &str) -> String {
+            format!("/auth/google/callback?code={code}&state={state}")
+        }
+
+        let database_url = std::env::var("AUTH_FOUNDATION_TEST_DATABASE_URL")
+            .expect("AUTH_FOUNDATION_TEST_DATABASE_URL");
+        let redis_url = std::env::var("AUTH_FOUNDATION_TEST_REDIS_URL")
+            .expect("AUTH_FOUNDATION_TEST_REDIS_URL");
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&database_url)
+            .await
+            .expect("connect disposable PostgreSQL");
+        let redis_connection = redis::Client::open(redis_url)
+            .expect("open disposable Redis")
+            .get_multiplexed_tokio_connection()
+            .await
+            .expect("connect disposable Redis");
+        let suffix = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time after epoch")
+            .as_nanos();
+        let service_id = format!("t11{suffix}");
+        insert_service(&pool, &service_id, true).await;
+
+        let fake_google = FakeGoogle {
+            token_calls: Arc::new(AtomicUsize::new(0)),
+            userinfo_calls: Arc::new(AtomicUsize::new(0)),
+            mode: Arc::new(AtomicUsize::new(0)),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake Google");
+        let address = listener.local_addr().expect("fake Google address");
+        let fake_google_server_state = fake_google.clone();
+        let fake_google_server = HttpServer::new(move || {
+            App::new()
+                .app_data(web::Data::new(fake_google_server_state.clone()))
+                .route("/token", web::post().to(token))
+                .route("/userinfo", web::get().to(userinfo))
+        })
+        .listen(listener)
+        .expect("listen fake Google")
+        .run();
+        let fake_google_handle = fake_google_server.handle();
+        actix_web::rt::spawn(fake_google_server);
+        let token_url = format!("http://{address}/token");
+        let userinfo_url = format!("http://{address}/userinfo");
+        let google_config = GoogleCallbackConfig {
+            oauth_client: BasicClient::new(
+                ClientId::new("test-client".to_owned()),
+                Some(ClientSecret::new("test-secret".to_owned())),
+                AuthUrl::new("https://accounts.example.test/authorize".to_owned())
+                    .expect("authorization URL"),
+                Some(TokenUrl::new(token_url).expect("token URL")),
+            )
+            .set_redirect_uri(
+                RedirectUrl::new("https://auth.example.test/auth/google/callback".to_owned())
+                    .expect("redirect URL"),
+            ),
+            userinfo_url: reqwest::Url::parse(&userinfo_url).expect("userinfo URL"),
+        };
+        let app = actix_web::test::init_service(
+            App::new()
+                .app_data(web::Data::new(pool.clone()))
+                .app_data(web::Data::new(redis_connection.clone()))
+                .app_data(web::Data::new(google_config))
+                .service(google_auth_callback),
+        )
+        .await;
+
+        // 正常 callback: 新規本人、Cookie、handoff、二重 callback。
+        let new_reference = generate_reference_value().expect("external reference");
+        insert_external(
+            &mut redis_connection.clone(),
+            &new_reference,
+            &service_id,
+            "new-state",
+        )
+        .await;
+        let users_before: i64 = sqlx::query_scalar("SELECT count(*) FROM public.internal_users")
+            .fetch_one(&pool)
+            .await
+            .expect("count users");
+        let response = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&callback_uri("valid-code", &new_reference))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), actix_web::http::StatusCode::FOUND);
+        let location = reqwest::Url::parse(
+            response
+                .headers()
+                .get(header::LOCATION)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+        )
+        .expect("callback Location");
+        assert_eq!(location.host_str(), Some("service.example.test"));
+        let pairs: std::collections::HashMap<_, _> = location.query_pairs().into_owned().collect();
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs.get("state"), Some(&"new-state".to_owned()));
+        let handoff_reference = pairs.get("code").expect("handoff code").to_owned();
+        assert!(!location.as_str().contains("google-subject-new"));
+        assert!(!location.as_str().contains("user@example.test"));
+        let set_cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("auth cookie")
+            .to_str()
+            .unwrap();
+        assert_eq!(response.headers().get_all(header::SET_COOKIE).count(), 1);
+        assert!(set_cookie.starts_with("__Host-auth_session="));
+        for attribute in ["Path=/", "Secure", "HttpOnly", "SameSite=Lax"] {
+            assert!(set_cookie.contains(attribute));
+        }
+        assert!(!set_cookie.contains("Domain="));
+        assert!(!set_cookie.contains("Max-Age="));
+        assert!(!set_cookie.contains("Expires="));
+        let session_reference = Cookie::parse(set_cookie.to_owned())
+            .expect("parse cookie")
+            .value()
+            .to_owned();
+        let now = unix_seconds(SystemTime::now()).expect("clock");
+        let mut connection = redis_connection.clone();
+        let external = read_external(&mut connection, &new_reference, now)
+            .await
+            .expect("claimed transaction");
+        assert_eq!(external.status, ExternalStatus::Processing);
+        let session = read_session(&mut connection, &session_reference, now)
+            .await
+            .expect("CommonSession");
+        assert_eq!(session.authenticated_at, session.created_at);
+        assert_eq!(
+            session.expires_at - session.created_at,
+            COMMON_SESSION_TTL_SECONDS
+        );
+        let handoff = read_handoff(&mut connection, &handoff_reference, now)
+            .await
+            .expect("handoff");
+        assert_eq!(handoff.service_id, service_id);
+        assert_eq!(handoff.internal_user_id, session.internal_user_id);
+        assert_eq!(
+            handoff.common_session_lookup,
+            reference_value_lookup(&session_reference)
+        );
+        assert_eq!(handoff.code_challenge, external.handoff_code_challenge);
+        assert_eq!(handoff.authenticated_at, session.authenticated_at);
+        assert_eq!(handoff.issued_at, session.authenticated_at);
+        assert_eq!(
+            handoff.expires_at - handoff.issued_at,
+            AUTHENTICATION_HANDOFF_TTL_SECONDS
+        );
+        assert_eq!(handoff.status, UsageStatus::Unused);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM public.internal_users")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            users_before + 1
+        );
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM public.external_identities WHERE provider = 'google' AND subject = 'google-subject-new'").fetch_one(&pool).await.unwrap(), 1);
+        assert_eq!(fake_google.token_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fake_google.userinfo_calls.load(Ordering::SeqCst), 1);
+        let sessions_before = redis_key_count(&mut connection, "auth:session:*").await;
+        let handoffs_before = redis_key_count(&mut connection, "auth:handoff:*").await;
+        let duplicate = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&callback_uri("valid-code", &new_reference))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(duplicate.status(), actix_web::http::StatusCode::BAD_REQUEST);
+        assert_eq!(fake_google.token_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fake_google.userinfo_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            redis_key_count(&mut connection, "auth:session:*").await,
+            sessions_before
+        );
+        assert_eq!(
+            redis_key_count(&mut connection, "auth:handoff:*").await,
+            handoffs_before
+        );
+
+        // 既存本人は provider + subject のみで解決し、新規ユーザーを作らない。
+        let existing_user: i32 = sqlx::query(
+            "INSERT INTO public.internal_users DEFAULT VALUES RETURNING internal_user_id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .try_get("internal_user_id")
+        .unwrap();
+        sqlx::query("INSERT INTO public.external_identities (provider, subject, internal_user_id) VALUES ('google', 'google-subject-new', $1) ON CONFLICT (provider, subject) DO UPDATE SET internal_user_id = EXCLUDED.internal_user_id")
+            .bind(existing_user).execute(&pool).await.unwrap();
+        let existing_reference = generate_reference_value().unwrap();
+        insert_external(
+            &mut connection,
+            &existing_reference,
+            &service_id,
+            "existing-state",
+        )
+        .await;
+        let users_before_existing: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM public.internal_users")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let existing_response = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&callback_uri("existing-code", &existing_reference))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(
+            existing_response.status(),
+            actix_web::http::StatusCode::FOUND
+        );
+        let existing_cookie = Cookie::parse(
+            existing_response
+                .headers()
+                .get(header::SET_COOKIE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned(),
+        )
+        .unwrap()
+        .value()
+        .to_owned();
+        assert_eq!(
+            read_session(
+                &mut connection,
+                &existing_cookie,
+                unix_seconds(SystemTime::now()).unwrap()
+            )
+            .await
+            .unwrap()
+            .internal_user_id,
+            existing_user
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM public.internal_users")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            users_before_existing
+        );
+
+        // query validation は claim/Google 呼出前に止まる。
+        let input_reference = generate_reference_value().unwrap();
+        insert_external(
+            &mut connection,
+            &input_reference,
+            &service_id,
+            "input-state",
+        )
+        .await;
+        let token_before = fake_google.token_calls.load(Ordering::SeqCst);
+        let userinfo_before = fake_google.userinfo_calls.load(Ordering::SeqCst);
+        for uri in [
+            format!("/auth/google/callback?state={input_reference}"),
+            format!("/auth/google/callback?code=&state={input_reference}"),
+            callback_uri(&"x".repeat(4097), &input_reference),
+            callback_uri("code", "invalid"),
+            format!("{}&code=other", callback_uri("code", &input_reference)),
+            format!("{}&state=other", callback_uri("code", &input_reference)),
+            format!("/auth/google/callback?error=access_denied&state={input_reference}"),
+        ] {
+            let rejected = actix_web::test::call_service(
+                &app,
+                actix_web::test::TestRequest::get().uri(&uri).to_request(),
+            )
+            .await;
+            assert_eq!(rejected.status(), actix_web::http::StatusCode::BAD_REQUEST);
+        }
+        assert_eq!(
+            read_external(
+                &mut connection,
+                &input_reference,
+                unix_seconds(SystemTime::now()).unwrap()
+            )
+            .await
+            .unwrap()
+            .status,
+            ExternalStatus::Waiting
+        );
+        assert_eq!(fake_google.token_calls.load(Ordering::SeqCst), token_before);
+        assert_eq!(
+            fake_google.userinfo_calls.load(Ordering::SeqCst),
+            userinfo_before
+        );
+
+        // disabled user は claim 後に 403、service disabled は Google 呼出前に 403。
+        let disabled_user: i32 = sqlx::query("INSERT INTO public.internal_users (is_enabled) VALUES (false) RETURNING internal_user_id").fetch_one(&pool).await.unwrap().try_get("internal_user_id").unwrap();
+        sqlx::query("INSERT INTO public.external_identities (provider, subject, internal_user_id) VALUES ('google', 'google-subject-disabled', $1)").bind(disabled_user).execute(&pool).await.unwrap();
+        fake_google.mode.store(4, Ordering::SeqCst);
+        let disabled_reference = generate_reference_value().unwrap();
+        insert_external(
+            &mut connection,
+            &disabled_reference,
+            &service_id,
+            "disabled-state",
+        )
+        .await;
+        let disabled_sessions = redis_key_count(&mut connection, "auth:session:*").await;
+        let disabled_handoffs = redis_key_count(&mut connection, "auth:handoff:*").await;
+        let disabled_response = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&callback_uri("disabled-user", &disabled_reference))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(
+            disabled_response.status(),
+            actix_web::http::StatusCode::FORBIDDEN
+        );
+        assert!(disabled_response.headers().get(header::LOCATION).is_none());
+        assert!(disabled_response
+            .headers()
+            .get(header::SET_COOKIE)
+            .is_none());
+        assert_eq!(
+            read_external(
+                &mut connection,
+                &disabled_reference,
+                unix_seconds(SystemTime::now()).unwrap()
+            )
+            .await
+            .unwrap()
+            .status,
+            ExternalStatus::Processing
+        );
+        assert_eq!(
+            redis_key_count(&mut connection, "auth:session:*").await,
+            disabled_sessions
+        );
+        assert_eq!(
+            redis_key_count(&mut connection, "auth:handoff:*").await,
+            disabled_handoffs
+        );
+
+        // Google token failure: processing に固定され、再送しても再実行しない。
+        fake_google.mode.store(1, Ordering::SeqCst);
+        let token_failure_reference = generate_reference_value().unwrap();
+        insert_external(
+            &mut connection,
+            &token_failure_reference,
+            &service_id,
+            "token-failure",
+        )
+        .await;
+        let token_calls_before = fake_google.token_calls.load(Ordering::SeqCst);
+        let userinfo_calls_before = fake_google.userinfo_calls.load(Ordering::SeqCst);
+        let token_failure = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&callback_uri("token-failure", &token_failure_reference))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(
+            token_failure.status(),
+            actix_web::http::StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            read_external(
+                &mut connection,
+                &token_failure_reference,
+                unix_seconds(SystemTime::now()).unwrap()
+            )
+            .await
+            .unwrap()
+            .status,
+            ExternalStatus::Processing
+        );
+        assert_eq!(
+            fake_google.token_calls.load(Ordering::SeqCst),
+            token_calls_before + 1
+        );
+        assert_eq!(
+            fake_google.userinfo_calls.load(Ordering::SeqCst),
+            userinfo_calls_before
+        );
+        assert!(token_failure.headers().get(header::SET_COOKIE).is_none());
+        assert_eq!(
+            redis_key_count(&mut connection, "auth:session:*").await,
+            disabled_sessions
+        );
+        assert_eq!(
+            redis_key_count(&mut connection, "auth:handoff:*").await,
+            disabled_handoffs
+        );
+        let token_retry = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&callback_uri("token-failure", &token_failure_reference))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(
+            token_retry.status(),
+            actix_web::http::StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            fake_google.token_calls.load(Ordering::SeqCst),
+            token_calls_before + 1
+        );
+
+        // userinfo failure と不正 identity は、session/handoff/cookie を作らず 502。
+        for mode in [2, 3] {
+            fake_google.mode.store(mode, Ordering::SeqCst);
+            let reference = generate_reference_value().unwrap();
+            insert_external(&mut connection, &reference, &service_id, "userinfo-failure").await;
+            let sessions = redis_key_count(&mut connection, "auth:session:*").await;
+            let handoffs = redis_key_count(&mut connection, "auth:handoff:*").await;
+            let response = actix_web::test::call_service(
+                &app,
+                actix_web::test::TestRequest::get()
+                    .uri(&callback_uri("userinfo-failure", &reference))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), actix_web::http::StatusCode::BAD_GATEWAY);
+            assert!(response.headers().get(header::SET_COOKIE).is_none());
+            assert_eq!(
+                redis_key_count(&mut connection, "auth:session:*").await,
+                sessions
+            );
+            assert_eq!(
+                redis_key_count(&mut connection, "auth:handoff:*").await,
+                handoffs
+            );
+        }
+
+        // service disabled after start は claim 後、Google 呼出前に停止する。
+        fake_google.mode.store(0, Ordering::SeqCst);
+        let disabled_service_id = format!("t11disabled{suffix}");
+        insert_service(&pool, &disabled_service_id, true).await;
+        let service_disabled_reference = generate_reference_value().unwrap();
+        insert_external(
+            &mut connection,
+            &service_disabled_reference,
+            &disabled_service_id,
+            "service-disabled",
+        )
+        .await;
+        sqlx::query(
+            "UPDATE public.registered_web_services SET is_enabled = false WHERE service_id = $1",
+        )
+        .bind(&disabled_service_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let token_before_disabled = fake_google.token_calls.load(Ordering::SeqCst);
+        let userinfo_before_disabled = fake_google.userinfo_calls.load(Ordering::SeqCst);
+        let service_disabled = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&callback_uri(
+                    "service-disabled",
+                    &service_disabled_reference,
+                ))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(
+            service_disabled.status(),
+            actix_web::http::StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            read_external(
+                &mut connection,
+                &service_disabled_reference,
+                unix_seconds(SystemTime::now()).unwrap()
+            )
+            .await
+            .unwrap()
+            .status,
+            ExternalStatus::Processing
+        );
+        assert_eq!(
+            fake_google.token_calls.load(Ordering::SeqCst),
+            token_before_disabled
+        );
+        assert_eq!(
+            fake_google.userinfo_calls.load(Ordering::SeqCst),
+            userinfo_before_disabled
+        );
+
+        // 壊れた ExternalAuthTransaction は 503 で Google に到達しない。
+        let invalid_redis_reference = generate_reference_value().unwrap();
+        insert_external(
+            &mut connection,
+            &invalid_redis_reference,
+            &service_id,
+            "invalid-redis",
+        )
+        .await;
+        let _: i32 = redis::cmd("HDEL")
+            .arg(crate::redis_state::external_key(&invalid_redis_reference))
+            .arg("service_id")
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        let token_before_invalid_redis = fake_google.token_calls.load(Ordering::SeqCst);
+        let invalid_redis = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&callback_uri("invalid-redis", &invalid_redis_reference))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(
+            invalid_redis.status(),
+            actix_web::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            fake_google.token_calls.load(Ordering::SeqCst),
+            token_before_invalid_redis
+        );
+
+        fake_google_handle.stop(true).await;
     }
 
     #[test]

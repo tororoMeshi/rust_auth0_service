@@ -37,6 +37,30 @@ pub(crate) enum TimeBoundaryError {
     Overflow,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EmailVerification {
+    Verified,
+    Unverified,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NormalizedExternalIdentity {
+    pub(crate) provider: String,
+    pub(crate) subject: String,
+    pub(crate) email: Option<String>,
+    pub(crate) email_verification: EmailVerification,
+    pub(crate) display_name: Option<String>,
+    pub(crate) picture_url: Option<String>,
+}
+
+impl NormalizedExternalIdentity {
+    pub(crate) fn validate(&self) -> Result<(), InputBoundaryError> {
+        validate_nonempty_max_bytes(&self.provider, PROVIDER_MAX_BYTES)?;
+        validate_nonempty_max_bytes(&self.subject, SUBJECT_MAX_BYTES)
+    }
+}
+
 pub(crate) fn generate_reference_value() -> Result<String, rand::Error> {
     let mut bytes = [0_u8; REFERENCE_VALUE_RANDOM_BYTES];
     OsRng.try_fill_bytes(&mut bytes)?;
@@ -84,6 +108,14 @@ pub(crate) fn validate_max_bytes(value: &str, max: usize) -> Result<(), InputBou
         Ok(())
     } else {
         Err(InputBoundaryError::InvalidLength)
+    }
+}
+
+fn validate_nonempty_max_bytes(value: &str, max: usize) -> Result<(), InputBoundaryError> {
+    if value.is_empty() || value.len() > max {
+        Err(InputBoundaryError::InvalidLength)
+    } else {
+        Ok(())
     }
 }
 
@@ -183,6 +215,36 @@ mod tests {
             validate_max_bytes("あ", 2),
             Err(InputBoundaryError::InvalidLength)
         );
+    }
+
+    #[test]
+    fn normalized_external_identity_validates_provider_and_subject_boundaries() {
+        let identity = NormalizedExternalIdentity {
+            provider: "google".to_owned(),
+            subject: "subject".to_owned(),
+            email: Some("person@example.test".to_owned()),
+            email_verification: EmailVerification::Verified,
+            display_name: None,
+            picture_url: None,
+        };
+        assert!(identity.validate().is_ok());
+
+        for (provider, subject) in [
+            ("", "subject"),
+            (&"p".repeat(PROVIDER_MAX_BYTES + 1), "subject"),
+            ("google", ""),
+            ("google", &"s".repeat(SUBJECT_MAX_BYTES + 1)),
+        ] {
+            let identity = NormalizedExternalIdentity {
+                provider: provider.to_owned(),
+                subject: subject.to_owned(),
+                email: None,
+                email_verification: EmailVerification::Unknown,
+                display_name: None,
+                picture_url: None,
+            };
+            assert_eq!(identity.validate(), Err(InputBoundaryError::InvalidLength));
+        }
     }
 
     #[test]
