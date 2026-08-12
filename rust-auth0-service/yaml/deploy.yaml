@@ -56,6 +56,23 @@ spec:
           # Redis session store
           - name: REDIS_URL
             value: "redis://rfrm-redisfailover:6379"
+          # Auth foundation PostgreSQL connection
+          - name: PGHOST
+            value: "auth0-account-db"
+          - name: PGPORT
+            value: "5432"
+          - name: PGDATABASE
+            value: "auth0_accounts"
+          - name: PGUSER
+            valueFrom:
+              secretKeyRef:
+                name: auth0-app-user.auth0-account-db.credentials.postgresql.acid.zalan.do
+                key: username
+          - name: PGPASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: auth0-app-user.auth0-account-db.credentials.postgresql.acid.zalan.do
+                key: password
           # session-secret / SESSION_SECRET_KEY
           - name: SESSION_SECRET_KEY
             valueFrom:

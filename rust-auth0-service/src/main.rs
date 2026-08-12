@@ -25,6 +25,8 @@ use oauth2::{
 };
 use rand::{distributions::Alphanumeric, Rng};
 use serde::{Deserialize, Serialize};
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::PgPool;
 use std::{env, io};
 
 #[derive(Clone)]
@@ -33,6 +35,61 @@ struct AppConfig {
     google_client_secret: String,
     google_redirect_uri: String,
     uniauth_url: String,
+}
+
+struct AuthFoundationConfig {
+    google_client_id: String,
+    google_client_secret: String,
+    google_redirect_uri: String,
+    redis_url: String,
+    pg_host: String,
+    pg_port: u16,
+    pg_database: String,
+    pg_user: String,
+    pg_password: String,
+}
+
+impl AuthFoundationConfig {
+    fn from_env() -> io::Result<Self> {
+        let pg_port = required_nonempty_env("PGPORT")?
+            .parse::<u16>()
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "PGPORT environment variable must be a valid u16",
+                )
+            })?;
+
+        Ok(Self {
+            google_client_id: required_nonempty_env("GOOGLE_CLIENT_ID")?,
+            google_client_secret: required_nonempty_env("GOOGLE_CLIENT_SECRET")?,
+            google_redirect_uri: required_nonempty_env("GOOGLE_REDIRECT_URI")?,
+            redis_url: required_nonempty_env("REDIS_URL")?,
+            pg_host: required_nonempty_env("PGHOST")?,
+            pg_port,
+            pg_database: required_nonempty_env("PGDATABASE")?,
+            pg_user: required_nonempty_env("PGUSER")?,
+            pg_password: required_nonempty_env("PGPASSWORD")?,
+        })
+    }
+}
+
+fn required_nonempty_env(name: &str) -> io::Result<String> {
+    let value = env::var(name).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} environment variable is required"),
+        )
+    })?;
+
+    if value.trim().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} environment variable is required"),
+        ));
+    }
+
+    Ok(value)
 }
 
 fn required_env(name: &str) -> io::Result<String> {
@@ -192,16 +249,16 @@ async fn start_google_auth(
         .take(16)
         .map(char::from)
         .collect();
-    if let Err(e) = session.insert("oauth_state", state.clone()) {
-        error!("Failed to insert oauth_state: {:?}", e);
+    if let Err(_) = session.insert("oauth_state", state.clone()) {
+        error!("Failed to store OAuth request data in legacy session");
         return HttpResponse::InternalServerError()
             .body("Internal server error: cannot set oauth_state");
     }
 
     // ログイン前のリダイレクト先をセッションに保存
     if let Some(ref redirect) = query.redirect {
-        if let Err(e) = session.insert("redirect", redirect) {
-            error!("Failed to insert redirect: {:?}", e);
+        if let Err(_) = session.insert("redirect", redirect) {
+            error!("Failed to store redirect in legacy session");
             return HttpResponse::InternalServerError()
                 .body("Internal server error: cannot set redirect");
         }
@@ -212,7 +269,7 @@ async fn start_google_auth(
         "https://accounts.google.com/o/oauth2/auth?response_type=code&client_id={}&redirect_uri={}&scope=email%20profile&access_type=offline&prompt=consent&state={}",
         config.google_client_id, config.google_redirect_uri, state
     );
-    info!("Redirecting to Google OAuth URL: {}", auth_url);
+    info!("redirecting to Google authorization endpoint");
 
     HttpResponse::Found()
         .append_header(("Location", auth_url))
@@ -242,14 +299,14 @@ async fn google_auth_callback(
     // セッションに保存された state と受信した state の比較（CSRF 対策）
     let stored_state: Option<String> = match session.get("oauth_state") {
         Ok(value) => value,
-        Err(e) => {
-            error!("Failed to get oauth_state: {:?}", e);
+        Err(_) => {
+            error!("Failed to read OAuth request data from legacy session");
             return HttpResponse::InternalServerError()
                 .body("Internal server error: cannot get oauth_state");
         }
     };
     if stored_state.as_deref() != Some(query.state.as_str()) {
-        error!("State parameter mismatch. Potential CSRF attack.");
+        error!("OAuth request validation failed");
         return HttpResponse::BadRequest()
             .body("Invalid state parameter. Please try logging in again.");
     }
@@ -257,24 +314,24 @@ async fn google_auth_callback(
     // Google からアクセストークンを取得
     let auth_url = match AuthUrl::new("https://accounts.google.com/o/oauth2/auth".to_string()) {
         Ok(url) => url,
-        Err(e) => {
-            error!("Invalid Google auth URL: {:?}", e);
+        Err(_) => {
+            error!("Google authorization endpoint configuration is invalid");
             return HttpResponse::InternalServerError()
                 .body("Internal server error: invalid auth URL");
         }
     };
     let token_url = match TokenUrl::new("https://oauth2.googleapis.com/token".to_string()) {
         Ok(url) => url,
-        Err(e) => {
-            error!("Invalid Google token URL: {:?}", e);
+        Err(_) => {
+            error!("Google token endpoint configuration is invalid");
             return HttpResponse::InternalServerError()
                 .body("Internal server error: invalid token URL");
         }
     };
     let redirect_uri = match RedirectUrl::new(config.google_redirect_uri.clone()) {
         Ok(url) => url,
-        Err(e) => {
-            error!("Invalid Google redirect URI: {:?}", e);
+        Err(_) => {
+            error!("Google redirect URI configuration is invalid");
             return HttpResponse::InternalServerError()
                 .body("Internal server error: invalid redirect URI");
         }
@@ -319,22 +376,22 @@ async fn google_auth_callback(
                                 .append_header(("Location", redirect_url))
                                 .finish()
                         }
-                        Err(e) => {
-                            error!("Error from uniauth: {:?}", e);
+                        Err(_) => {
+                            error!("legacy uniauth request failed");
                             HttpResponse::InternalServerError()
                                 .body("Failed to generate session. Please try again later.")
                         }
                     }
                 }
-                Err(err) => {
-                    error!("Failed to get user info: {:?}", err);
+                Err(_) => {
+                    error!("Google user info request failed");
                     HttpResponse::InternalServerError()
                         .body("Failed to get user info. Please try again later.")
                 }
             }
         }
-        Err(err) => {
-            error!("Error exchanging code: {:?}", err);
+        Err(_) => {
+            error!("Google token exchange failed");
             HttpResponse::BadRequest()
                 .body("Error exchanging code. Please retry the login process.")
         }
@@ -344,8 +401,8 @@ async fn google_auth_callback(
 #[post("/auth/logout")]
 async fn logout(req: HttpRequest, config: web::Data<AppConfig>) -> HttpResponse {
     if let Some(cookie) = req.cookie("session_id") {
-        if let Err(e) = request_logout_from_uniauth(&config.uniauth_url, cookie.value()).await {
-            error!("Failed to delete session from uniauth: {:?}", e);
+        if let Err(_) = request_logout_from_uniauth(&config.uniauth_url, cookie.value()).await {
+            error!("legacy uniauth logout request failed");
         }
     }
 
@@ -421,10 +478,44 @@ async fn main() -> std::io::Result<()> {
     use actix_cors::Cors;
     use actix_web::http::header;
 
+    let auth_foundation_config = AuthFoundationConfig::from_env()?;
+
+    let postgres_options = PgConnectOptions::new()
+        .host(&auth_foundation_config.pg_host)
+        .port(auth_foundation_config.pg_port)
+        .database(&auth_foundation_config.pg_database)
+        .username(&auth_foundation_config.pg_user)
+        .password(&auth_foundation_config.pg_password);
+    let postgres_pool: PgPool = PgPoolOptions::new()
+        .connect_with(postgres_options)
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "failed to connect to PostgreSQL",
+            )
+        })?;
+    info!("PostgreSQL connection established");
+
+    let redis_client =
+        redis::Client::open(auth_foundation_config.redis_url.as_str()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "failed to create Redis client")
+        })?;
+    let redis_connection = redis_client
+        .get_multiplexed_tokio_connection()
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "failed to connect to Redis",
+            )
+        })?;
+    info!("Redis connection established");
+
     let config = AppConfig {
-        google_client_id: required_env("GOOGLE_CLIENT_ID")?,
-        google_client_secret: required_env("GOOGLE_CLIENT_SECRET")?,
-        google_redirect_uri: required_env("GOOGLE_REDIRECT_URI")?,
+        google_client_id: auth_foundation_config.google_client_id.clone(),
+        google_client_secret: auth_foundation_config.google_client_secret.clone(),
+        google_redirect_uri: auth_foundation_config.google_redirect_uri.clone(),
         uniauth_url: env::var("UNIAUTH_URL").unwrap_or_else(|_| "http://uniauth:8081".to_string()),
     };
 
@@ -433,13 +524,16 @@ async fn main() -> std::io::Result<()> {
     validate_post_login_redirect(&post_login_redirect, &allowed_redirect_origins)?;
 
     // RedisSessionStore の初期化
-    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://redis:6379".to_string());
-    let redis_store = RedisSessionStore::new(redis_url).await.map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::ConnectionRefused,
-            format!("failed to create Redis session store: {e}"),
-        )
-    })?;
+    let redis_store = RedisSessionStore::new(auth_foundation_config.redis_url.clone())
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "failed to create legacy Redis session store",
+            )
+        })?;
+
+    drop(auth_foundation_config);
 
     // セッション Cookie 署名用の秘密鍵
     let secret_key = required_env("SESSION_SECRET_KEY")?;
@@ -461,6 +555,8 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .wrap(cors)
             .app_data(web::Data::new(config.clone()))
+            .app_data(web::Data::new(postgres_pool.clone()))
+            .app_data(web::Data::new(redis_connection.clone()))
             .app_data(web::Data::new(redis_store.clone()))
             .wrap(SessionMiddleware::new(
                 redis_store.clone(),
