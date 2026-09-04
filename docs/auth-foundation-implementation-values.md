@@ -100,3 +100,9 @@ Secretは、Google client secret、PostgreSQL credential、Redis credentialが�
 T09〜T12により、production configuration boundary、Google/Redis/PostgreSQL起動設定、login、Google callback、handoff exchange、logout、および登録済みURI検証を含む認証基盤単体が成立したことを人間が承認した。browser単独で認証を成立させず、backend交換・service_id拘束・one-time handoff・PKCE S256を必須とし、アプリケーションには `internal_user_id` と `authenticated_at` のみを返す。CommonSessionはauth-host-onlyとし、親ドメインCookie、JWT置換フロー、provider subject/tokenの返却は行わない。callback claim、Redis/storage failure、logout GET/POST・CSRF、登録済みcallback/logout URIの扱いを含む主要不変条件を確認済みである。
 
 独立レビュー結果は `APPROVE`、T12 commit可能およびGate B進行可能であり、`cargo fmt --check`、`cargo check`、`cargo test`、関連するPostgreSQL/Redis/HTTP integration、`git diff --check` はすべてPASSである。次の作業はT13以降とする。
+
+## 12. Gate C承認
+
+T13〜T15により、`portal_backend` 単体の認証経路が成立したことを人間が承認した。LoginStart / LocalSessionはprocess memoryで管理し、LoginStartのone-shot claim、handoffの自動retryなし、LocalSessionのみを認可根拠とする保護API、portalローカルログアウトのCSRF、JWT runtime認証の削除、および同一オリジンのbackend route境界を確認済みである。
+
+独立レビュー結果は `APPROVE`、T15 commit可能およびGate C進行可能であり、25 tests、`cargo fmt --check`、`cargo check --locked`、`cargo test --locked`、`git diff --check` はすべてPASSである。次の作業はT16/T17およびT18とする。
