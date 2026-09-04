@@ -10,11 +10,31 @@ spec:
   - host: auth.tororomeshi.net
     http:
       paths:
-      - path: /
-        pathType: Prefix
+      - path: /auth/login
+        pathType: Exact
         backend:
           service:
             name: rust-auth0-service
             port:
               number: 8080
-
+      - path: /auth/google/callback
+        pathType: Exact
+        backend:
+          service:
+            name: rust-auth0-service
+            port:
+              number: 8080
+      - path: /auth/handoffs/exchange
+        pathType: Exact
+        backend:
+          service:
+            name: rust-auth0-service
+            port:
+              number: 8080
+      - path: /auth/logout
+        pathType: Exact
+        backend:
+          service:
+            name: rust-auth0-service
+            port:
+              number: 8080
