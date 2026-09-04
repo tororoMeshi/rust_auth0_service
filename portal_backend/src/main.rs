@@ -3,7 +3,6 @@ use base64::Engine;
 use chrono::Utc;
 use cookie::Cookie;
 use cookie::SameSite;
-use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -14,9 +13,12 @@ use std::env;
 use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
 use url::Url;
+use warp::http::{header, HeaderMap};
 use warp::Filter;
+use warp::Reply;
 
 const LOGIN_START_TTL_SECONDS: u64 = 600;
 const LOCAL_SESSION_TTL_SECONDS: u64 = 28_800;
@@ -365,11 +367,56 @@ fn delete_login_context_cookie() -> Cookie<'static> {
         .build()
 }
 
+fn delete_portal_session_cookie() -> Cookie<'static> {
+    Cookie::build((PORTAL_SESSION_COOKIE_NAME, ""))
+        .path("/")
+        .secure(true)
+        .http_only(true)
+        .same_site(SameSite::Lax)
+        .max_age(cookie::time::Duration::seconds(0))
+        .build()
+}
+
+fn delete_portal_csrf_cookie() -> Cookie<'static> {
+    Cookie::build((PORTAL_CSRF_COOKIE_NAME, ""))
+        .path("/")
+        .secure(true)
+        .same_site(SameSite::Lax)
+        .max_age(cookie::time::Duration::seconds(0))
+        .build()
+}
+
 fn is_fixed_reference(value: &str) -> bool {
     value.len() == 43
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
+fn fixed_reference_cookie_from_headers(headers: &HeaderMap, name: &str) -> Result<String, ()> {
+    let mut value = None;
+    for header_value in headers.get_all(header::COOKIE).iter() {
+        let cookie_header = header_value.to_str().map_err(|_| ())?;
+        for cookie in Cookie::split_parse(cookie_header) {
+            let cookie = cookie.map_err(|_| ())?;
+            if cookie.name() == name {
+                if value.is_some() || !is_fixed_reference(cookie.value()) {
+                    return Err(());
+                }
+                value = Some(cookie.value().to_string());
+            }
+        }
+    }
+    value.ok_or(())
+}
+
+fn csrf_header_from_headers(headers: &HeaderMap) -> Result<String, ()> {
+    let mut values = headers.get_all("x-csrf-token").iter();
+    let value = values.next().ok_or(())?.to_str().map_err(|_| ())?;
+    if values.next().is_some() || !is_fixed_reference(value) {
+        return Err(());
+    }
+    Ok(value.to_string())
 }
 
 fn auth_foundation_endpoint(base_url: &Url, path: &str) -> Url {
@@ -605,24 +652,10 @@ fn unix_epoch_seconds() -> u64 {
         .as_secs()
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Claims {
-    sub: String,
-    exp: usize,
-    #[serde(flatten)]
-    extra: HashMap<String, serde_json::Value>,
-}
-
 #[derive(Debug, Serialize)]
-struct UserResponse {
-    user: Claims,
-}
-
-#[derive(Debug, Serialize)]
-struct ErrorResponse {
-    error: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    details: Option<String>,
+struct MeResponse {
+    authenticated: bool,
+    internal_user_id: i32,
 }
 
 #[derive(Debug, Serialize)]
@@ -631,80 +664,79 @@ struct HealthResponse {
     timestamp: String,
 }
 
-async fn get_me(cookie_header: Option<String>) -> Result<impl warp::Reply, warp::Rejection> {
-    let now = Utc::now();
-    println!("[{}] GET /api/me", now.to_rfc3339());
-
-    let jwt_secret = match env::var("JWT_SECRET") {
-        Ok(secret) => secret,
-        Err(_) => {
-            eprintln!("JWT_SECRET environment variable is not set.");
-            return Ok(warp::reply::with_status(
-                warp::reply::json(&ErrorResponse {
-                    error: "Internal server error".to_string(),
-                    details: None,
-                }),
-                warp::http::StatusCode::INTERNAL_SERVER_ERROR,
-            ));
-        }
+async fn get_me(
+    headers: HeaderMap,
+    state: Arc<AppState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let reference = match fixed_reference_cookie_from_headers(&headers, PORTAL_SESSION_COOKIE_NAME)
+    {
+        Ok(reference) => reference,
+        Err(()) => return Ok(empty_response(warp::http::StatusCode::UNAUTHORIZED)),
     };
-
-    let token = match cookie_header {
-        Some(cookie_str) => {
-            let mut jwt_token = None;
-            for cookie_part in cookie_str.split(';') {
-                if let Ok(cookie) = Cookie::parse(cookie_part.trim()) {
-                    if cookie.name() == "jwt" {
-                        jwt_token = Some(cookie.value().to_string());
-                        break;
-                    }
-                }
-            }
-            match jwt_token {
-                Some(token) => token,
-                None => {
-                    return Ok(warp::reply::with_status(
-                        warp::reply::json(&ErrorResponse {
-                            error: "Not authenticated: JWT missing".to_string(),
-                            details: None,
-                        }),
-                        warp::http::StatusCode::UNAUTHORIZED,
-                    ));
-                }
-            }
-        }
-        None => {
-            return Ok(warp::reply::with_status(
-                warp::reply::json(&ErrorResponse {
-                    error: "Not authenticated: JWT missing".to_string(),
-                    details: None,
-                }),
-                warp::http::StatusCode::UNAUTHORIZED,
-            ));
-        }
+    let internal_user_id = {
+        let mut local_state = state.local_state.lock().await;
+        local_state
+            .get_local_session(&reference, unix_epoch_seconds())
+            .map(|session| session.internal_user_id)
     };
-
-    let decoding_key = DecodingKey::from_secret(jwt_secret.as_ref());
-    let validation = Validation::new(Algorithm::HS256);
-
-    match decode::<Claims>(&token, &decoding_key, &validation) {
-        Ok(token_data) => Ok(warp::reply::with_status(
-            warp::reply::json(&UserResponse {
-                user: token_data.claims,
-            }),
-            warp::http::StatusCode::OK,
-        )),
-        Err(err) => {
-            eprintln!("JWT verification failed: {:?}", err);
-            Ok(warp::reply::with_status(
-                warp::reply::json(&ErrorResponse {
-                    error: "Invalid JWT".to_string(),
-                    details: Some(err.to_string()),
-                }),
-                warp::http::StatusCode::UNAUTHORIZED,
-            ))
-        }
+    match internal_user_id {
+        Some(internal_user_id) => Ok(warp::reply::json(&MeResponse {
+            authenticated: true,
+            internal_user_id,
+        })
+        .into_response()),
+        None => Ok(empty_response(warp::http::StatusCode::UNAUTHORIZED)),
     }
+}
+
+async fn logout(
+    headers: HeaderMap,
+    state: Arc<AppState>,
+) -> Result<warp::reply::Response, warp::Rejection> {
+    let session_reference =
+        match fixed_reference_cookie_from_headers(&headers, PORTAL_SESSION_COOKIE_NAME) {
+            Ok(reference) => reference,
+            Err(()) => return Ok(empty_response(warp::http::StatusCode::FORBIDDEN)),
+        };
+    let csrf_cookie = match fixed_reference_cookie_from_headers(&headers, PORTAL_CSRF_COOKIE_NAME) {
+        Ok(value) => value,
+        Err(()) => return Ok(empty_response(warp::http::StatusCode::FORBIDDEN)),
+    };
+    let csrf_header = match csrf_header_from_headers(&headers) {
+        Ok(value) => value,
+        Err(()) => return Ok(empty_response(warp::http::StatusCode::FORBIDDEN)),
+    };
+
+    let removed = {
+        let mut local_state = state.local_state.lock().await;
+        let csrf_lookup =
+            match local_state.get_local_session(&session_reference, unix_epoch_seconds()) {
+                Some(session) => session.csrf_lookup,
+                None => return Ok(empty_response(warp::http::StatusCode::FORBIDDEN)),
+            };
+        if csrf_cookie
+            .as_bytes()
+            .ct_eq(csrf_header.as_bytes())
+            .unwrap_u8()
+            != 1
+        {
+            return Ok(empty_response(warp::http::StatusCode::FORBIDDEN));
+        }
+        let csrf_digest = sha256_digest(csrf_cookie.as_bytes());
+        if csrf_digest.ct_eq(&csrf_lookup).unwrap_u8() != 1 {
+            return Ok(empty_response(warp::http::StatusCode::FORBIDDEN));
+        }
+        local_state
+            .remove_local_session(&session_reference)
+            .is_some()
+    };
+    if !removed {
+        return Ok(empty_response(warp::http::StatusCode::FORBIDDEN));
+    }
+    let mut response = empty_response(warp::http::StatusCode::NO_CONTENT);
+    append_cookie(&mut response, delete_portal_session_cookie());
+    append_cookie(&mut response, delete_portal_csrf_cookie());
+    Ok(response)
 }
 
 async fn health() -> Result<impl warp::Reply, warp::Rejection> {
@@ -713,6 +745,54 @@ async fn health() -> Result<impl warp::Reply, warp::Rejection> {
         status: "OK".to_string(),
         timestamp,
     }))
+}
+
+fn routes(
+    state: Arc<AppState>,
+) -> impl Filter<Extract = (warp::reply::Response,), Error = warp::Rejection> + Clone {
+    let me_route = warp::path!("api" / "me")
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::header::headers_cloned())
+        .and(with_state(Arc::clone(&state)))
+        .and_then(get_me);
+
+    let health_route = warp::path!("health")
+        .and(warp::path::end())
+        .and(warp::get())
+        .and_then(health)
+        .map(warp::Reply::into_response);
+
+    let login_route = warp::path!("login")
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(with_state(Arc::clone(&state)))
+        .and_then(login);
+
+    let callback_route = warp::path!("auth" / "callback")
+        .and(warp::path::end())
+        .and(warp::get())
+        .and(warp::query::raw())
+        .and(warp::header::optional::<String>("cookie"))
+        .and(with_state(Arc::clone(&state)))
+        .and_then(callback);
+
+    let logout_route = warp::path!("logout")
+        .and(warp::path::end())
+        .and(warp::post())
+        .and(warp::header::headers_cloned())
+        .and(with_state(state))
+        .and_then(logout);
+
+    health_route
+        .or(login_route)
+        .unify()
+        .or(callback_route)
+        .unify()
+        .or(me_route)
+        .unify()
+        .or(logout_route)
+        .unify()
 }
 
 #[tokio::main]
@@ -758,42 +838,7 @@ async fn main() {
         .parse::<u16>()
         .unwrap_or(3000);
 
-    let frontend_url =
-        env::var("FRONTEND_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
-
-    let cors = warp::cors()
-        .allow_origin(frontend_url.as_str())
-        .allow_headers(vec!["content-type", "cookie"])
-        .allow_methods(vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"])
-        .allow_credentials(true);
-
-    let me_route = warp::path!("api" / "me")
-        .and(warp::get())
-        .and(warp::header::optional::<String>("cookie"))
-        .and_then(get_me);
-
-    let health_route = warp::path!("health").and(warp::get()).and_then(health);
-
-    let login_route = warp::path!("login")
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(with_state(Arc::clone(&state)))
-        .and_then(login);
-
-    let callback_route = warp::path!("auth" / "callback")
-        .and(warp::path::end())
-        .and(warp::get())
-        .and(warp::query::raw())
-        .and(warp::header::optional::<String>("cookie"))
-        .and(with_state(Arc::clone(&state)))
-        .and_then(callback);
-
-    let routes = me_route
-        .or(health_route)
-        .or(login_route)
-        .or(callback_route)
-        .with(cors)
-        .with(warp::log("portal_backend"));
+    let routes = routes(state).with(warp::log("portal_backend"));
 
     println!("Backend server running on port {}", port);
     warp::serve(routes).run(([0, 0, 0, 0], port)).await;
@@ -1469,5 +1514,447 @@ mod tests {
         .unwrap();
         assert_eq!(response.status(), warp::http::StatusCode::BAD_GATEWAY);
         assert!(!receiver.await.expect("redirect observation"));
+    }
+
+    async fn created_session(state: &Arc<AppState>) -> (String, String) {
+        state
+            .local_state
+            .lock()
+            .await
+            .create_local_session(123, 456, unix_epoch_seconds())
+            .unwrap()
+    }
+
+    fn session_cookie(reference: &str) -> String {
+        format!("{PORTAL_SESSION_COOKIE_NAME}={reference}")
+    }
+
+    fn csrf_cookie(value: &str) -> String {
+        format!("{PORTAL_CSRF_COOKIE_NAME}={value}")
+    }
+
+    #[tokio::test]
+    async fn protected_api_uses_only_one_valid_local_session_cookie() {
+        let state = test_state(Url::parse("https://auth.example").unwrap(), 2, 10);
+        let (reference, _) = created_session(&state).await;
+        let route = routes(Arc::clone(&state));
+
+        let success = warp::test::request()
+            .method("GET")
+            .path("/api/me")
+            .header("cookie", session_cookie(&reference))
+            .reply(&route)
+            .await;
+        assert_eq!(success.status(), warp::http::StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(success.body()).unwrap(),
+            serde_json::json!({"authenticated": true, "internal_user_id": 123})
+        );
+        assert!(state
+            .local_state
+            .lock()
+            .await
+            .local_sessions
+            .contains_key(&reference));
+
+        for request in [
+            warp::test::request().method("GET").path("/api/me"),
+            warp::test::request()
+                .method("GET")
+                .path("/api/me")
+                .header("cookie", format!("{PORTAL_SESSION_COOKIE_NAME}=bad")),
+            warp::test::request()
+                .method("GET")
+                .path("/api/me")
+                .header(
+                    "cookie",
+                    format!(
+                        "{PORTAL_SESSION_COOKIE_NAME}={reference}; {PORTAL_SESSION_COOKIE_NAME}={reference}"
+                    ),
+                ),
+            warp::test::request()
+                .method("GET")
+                .path("/api/me")
+                .header("cookie", format!("{PORTAL_SESSION_COOKIE_NAME}={}", "A".repeat(43))),
+            warp::test::request()
+                .method("GET")
+                .path("/api/me")
+                .header("cookie", "jwt=old-token"),
+            warp::test::request()
+                .method("GET")
+                .path("/api/me")
+                .header("cookie", "session_id=old-session"),
+            warp::test::request()
+                .method("GET")
+                .path("/api/me")
+                .header("authorization", "Bearer old-token"),
+        ] {
+            assert_eq!(
+                request.reply(&route).await.status(),
+                warp::http::StatusCode::UNAUTHORIZED
+            );
+        }
+
+        let restarted = routes(test_state(
+            Url::parse("https://auth.example").unwrap(),
+            2,
+            10,
+        ));
+        assert_eq!(
+            warp::test::request()
+                .method("GET")
+                .path("/api/me")
+                .header("cookie", session_cookie(&reference))
+                .reply(&restarted)
+                .await
+                .status(),
+            warp::http::StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn protected_api_rejects_expired_local_session() {
+        let state = test_state(Url::parse("https://auth.example").unwrap(), 2, 10);
+        let (reference, _) = created_session(&state).await;
+        state
+            .local_state
+            .lock()
+            .await
+            .local_sessions
+            .get_mut(&reference)
+            .unwrap()
+            .expires_at = 0;
+        let response = warp::test::request()
+            .method("GET")
+            .path("/api/me")
+            .header("cookie", session_cookie(&reference))
+            .reply(&routes(Arc::clone(&state)))
+            .await;
+        assert_eq!(response.status(), warp::http::StatusCode::UNAUTHORIZED);
+        assert!(!state
+            .local_state
+            .lock()
+            .await
+            .local_sessions
+            .contains_key(&reference));
+    }
+
+    #[tokio::test]
+    async fn logout_deletes_only_a_fully_valid_local_session() {
+        let state = test_state(Url::parse("https://auth.example").unwrap(), 2, 10);
+        let (reference, csrf) = created_session(&state).await;
+        let route = routes(Arc::clone(&state));
+        let response = warp::test::request()
+            .method("POST")
+            .path("/logout")
+            .header(
+                "cookie",
+                format!("{}; {}", session_cookie(&reference), csrf_cookie(&csrf)),
+            )
+            .header("x-csrf-token", &csrf)
+            .reply(&route)
+            .await;
+        assert_eq!(response.status(), warp::http::StatusCode::NO_CONTENT);
+        assert!(response.body().is_empty());
+        assert!(response.headers().get(header::LOCATION).is_none());
+        assert!(!state
+            .local_state
+            .lock()
+            .await
+            .local_sessions
+            .contains_key(&reference));
+        let cookies: Vec<_> = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| Cookie::parse(value.to_str().unwrap().to_string()).unwrap())
+            .collect();
+        for (name, http_only) in [
+            (PORTAL_SESSION_COOKIE_NAME, Some(true)),
+            (PORTAL_CSRF_COOKIE_NAME, None),
+        ] {
+            let cookie = cookies.iter().find(|cookie| cookie.name() == name).unwrap();
+            assert_eq!(cookie.value(), "");
+            assert_eq!(cookie.path(), Some("/"));
+            assert_eq!(cookie.secure(), Some(true));
+            assert_eq!(cookie.http_only(), http_only);
+            assert_eq!(cookie.same_site(), Some(SameSite::Lax));
+            assert_eq!(cookie.domain(), None);
+            assert_eq!(cookie.max_age().map(|value| value.whole_seconds()), Some(0));
+            assert_eq!(cookie.expires(), None);
+        }
+        assert_eq!(
+            warp::test::request()
+                .method("GET")
+                .path("/api/me")
+                .header("cookie", session_cookie(&reference))
+                .reply(&route)
+                .await
+                .status(),
+            warp::http::StatusCode::UNAUTHORIZED
+        );
+        assert_ne!(
+            warp::test::request()
+                .method("GET")
+                .path("/logout")
+                .reply(&route)
+                .await
+                .status(),
+            warp::http::StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn logout_failures_are_forbidden_and_preserve_valid_session() {
+        let state = test_state(Url::parse("https://auth.example").unwrap(), 2, 10);
+        let (reference, csrf) = created_session(&state).await;
+        let route = routes(Arc::clone(&state));
+        let valid_cookies = format!("{}; {}", session_cookie(&reference), csrf_cookie(&csrf));
+
+        for response in [
+            warp::test::request().method("POST").path("/logout"),
+            warp::test::request()
+                .method("POST")
+                .path("/logout")
+                .header("cookie", csrf_cookie(&csrf))
+                .header("x-csrf-token", &csrf),
+            warp::test::request()
+                .method("POST")
+                .path("/logout")
+                .header(
+                    "cookie",
+                    format!(
+                        "{}; {}",
+                        session_cookie(&"A".repeat(43)),
+                        csrf_cookie(&csrf)
+                    ),
+                )
+                .header("x-csrf-token", &csrf),
+            warp::test::request()
+                .method("POST")
+                .path("/logout")
+                .header("cookie", valid_cookies.clone()),
+            warp::test::request()
+                .method("POST")
+                .path("/logout")
+                .header("cookie", session_cookie(&reference))
+                .header("x-csrf-token", &csrf),
+        ] {
+            let response = response.reply(&route).await;
+            assert_eq!(response.status(), warp::http::StatusCode::FORBIDDEN);
+            assert!(response
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .next()
+                .is_none());
+            assert!(state
+                .local_state
+                .lock()
+                .await
+                .local_sessions
+                .contains_key(&reference));
+        }
+        // warp::test::RequestBuilder replaces duplicate headers, so send a raw HTTP request
+        // to prove the HeaderMap-wide duplicate X-CSRF-Token handling at the HTTP boundary.
+        {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+            let (address, server) = warp::serve(route.clone()).bind_ephemeral(([127, 0, 0, 1], 0));
+            let server = tokio::spawn(server);
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            let request = format!(
+                "POST /logout HTTP/1.1\r\nHost: example\r\nCookie: {valid_cookies}\r\nX-CSRF-Token: {csrf}\r\nX-CSRF-Token: {csrf}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            assert!(String::from_utf8(response)
+                .unwrap()
+                .starts_with("HTTP/1.1 403 "));
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            let request = format!(
+                "POST /logout HTTP/1.1\r\nHost: example\r\nCookie: {}\r\nCookie: {}\r\nX-CSRF-Token: {csrf}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                valid_cookies,
+                session_cookie(&reference),
+            );
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            server.abort();
+            assert!(String::from_utf8(response)
+                .unwrap()
+                .starts_with("HTTP/1.1 403 "));
+            assert!(state
+                .local_state
+                .lock()
+                .await
+                .local_sessions
+                .contains_key(&reference));
+        }
+        for response in [
+            warp::test::request()
+                .method("POST")
+                .path("/logout")
+                .header("cookie", format!("{PORTAL_SESSION_COOKIE_NAME}=bad; {}", csrf_cookie(&csrf)))
+                .header("x-csrf-token", &csrf),
+            warp::test::request()
+                .method("POST")
+                .path("/logout")
+                .header("cookie", format!("{PORTAL_SESSION_COOKIE_NAME}={reference}; {PORTAL_SESSION_COOKIE_NAME}={reference}; {}", csrf_cookie(&csrf)))
+                .header("x-csrf-token", &csrf),
+            warp::test::request()
+                .method("POST")
+                .path("/logout")
+                .header("cookie", format!("{}; {PORTAL_CSRF_COOKIE_NAME}=bad", session_cookie(&reference)))
+                .header("x-csrf-token", &csrf),
+            warp::test::request()
+                .method("POST")
+                .path("/logout")
+                .header("cookie", format!("{}; {PORTAL_CSRF_COOKIE_NAME}={csrf}; {PORTAL_CSRF_COOKIE_NAME}={csrf}", session_cookie(&reference)))
+                .header("x-csrf-token", &csrf),
+            warp::test::request()
+                .method("POST")
+                .path("/logout")
+                .header("cookie", &valid_cookies)
+                .header("x-csrf-token", "bad"),
+            warp::test::request()
+                .method("POST")
+                .path("/logout")
+                .header("cookie", &valid_cookies)
+                .header("x-csrf-token", "A".repeat(43)),
+        ] {
+            let response = response.reply(&route).await;
+            assert_eq!(response.status(), warp::http::StatusCode::FORBIDDEN);
+            assert!(response
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .next()
+                .is_none());
+            assert!(state
+                .local_state
+                .lock()
+                .await
+                .local_sessions
+                .contains_key(&reference));
+        }
+        state
+            .local_state
+            .lock()
+            .await
+            .local_sessions
+            .get_mut(&reference)
+            .unwrap()
+            .csrf_lookup = [0; 32];
+        let digest_mismatch = warp::test::request()
+            .method("POST")
+            .path("/logout")
+            .header("cookie", valid_cookies)
+            .header("x-csrf-token", &csrf)
+            .reply(&route)
+            .await;
+        assert_eq!(digest_mismatch.status(), warp::http::StatusCode::FORBIDDEN);
+        assert!(digest_mismatch
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .next()
+            .is_none());
+        assert!(state
+            .local_state
+            .lock()
+            .await
+            .local_sessions
+            .contains_key(&reference));
+    }
+
+    #[tokio::test]
+    async fn expired_and_restarted_local_sessions_cannot_logout() {
+        let state = test_state(Url::parse("https://auth.example").unwrap(), 2, 10);
+        let (reference, csrf) = created_session(&state).await;
+        state
+            .local_state
+            .lock()
+            .await
+            .local_sessions
+            .get_mut(&reference)
+            .unwrap()
+            .expires_at = 0;
+        let cookies = format!("{}; {}", session_cookie(&reference), csrf_cookie(&csrf));
+        let expired = warp::test::request()
+            .method("POST")
+            .path("/logout")
+            .header("cookie", &cookies)
+            .header("x-csrf-token", &csrf)
+            .reply(&routes(Arc::clone(&state)))
+            .await;
+        assert_eq!(expired.status(), warp::http::StatusCode::FORBIDDEN);
+        assert!(!state
+            .local_state
+            .lock()
+            .await
+            .local_sessions
+            .contains_key(&reference));
+        let restarted = routes(test_state(
+            Url::parse("https://auth.example").unwrap(),
+            2,
+            10,
+        ));
+        assert_eq!(
+            warp::test::request()
+                .method("POST")
+                .path("/logout")
+                .header("cookie", cookies)
+                .header("x-csrf-token", &csrf)
+                .reply(&restarted)
+                .await
+                .status(),
+            warp::http::StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_logout_has_exactly_one_success() {
+        let state = test_state(Url::parse("https://auth.example").unwrap(), 2, 10);
+        let (reference, csrf) = created_session(&state).await;
+        let cookies = format!("{}; {}", session_cookie(&reference), csrf_cookie(&csrf));
+        let first = routes(Arc::clone(&state));
+        let second = first.clone();
+        let (one, two) = tokio::join!(
+            warp::test::request()
+                .method("POST")
+                .path("/logout")
+                .header("cookie", &cookies)
+                .header("x-csrf-token", &csrf)
+                .reply(&first),
+            warp::test::request()
+                .method("POST")
+                .path("/logout")
+                .header("cookie", &cookies)
+                .header("x-csrf-token", &csrf)
+                .reply(&second),
+        );
+        let statuses = [one.status(), two.status()];
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| **status == warp::http::StatusCode::NO_CONTENT)
+                .count(),
+            1
+        );
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| **status == warp::http::StatusCode::FORBIDDEN)
+                .count(),
+            1
+        );
+        assert!(!state
+            .local_state
+            .lock()
+            .await
+            .local_sessions
+            .contains_key(&reference));
     }
 }
