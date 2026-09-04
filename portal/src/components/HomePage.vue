@@ -2,12 +2,13 @@
   <div class="login-page">
     <h1>Welcome to the Portal</h1>
     <button @click="login">Login with Google</button>
-    <button @click="goToDashboard">Go to Dashboard</button>
   </div>
 </template>
 
 <script>
+import { onMounted } from 'vue'
 import { useRouter } from 'vue-router'
+import apiClient from '../utils/axios'
 
 export default {
   name: 'HomePage',
@@ -15,17 +16,26 @@ export default {
     const router = useRouter()
 
     const login = () => {
-      const currentUrl = window.location.href
-      window.location.href = "https://auth.tororomeshi.net/auth/google?redirect=" + encodeURIComponent(currentUrl)
+      window.location.assign('/login')
     }
 
-    const goToDashboard = () => {
-      router.push('/dashboard')
+    const checkAuthentication = async () => {
+      try {
+        const response = await apiClient.get('/api/me')
+        if (response.data?.authenticated === true) {
+          router.replace('/dashboard')
+        }
+      } catch (error) {
+        if (error.response?.status === 401) {
+          return
+        }
+      }
     }
+
+    onMounted(checkAuthentication)
 
     return {
-      login,
-      goToDashboard
+      login
     }
   }
 }

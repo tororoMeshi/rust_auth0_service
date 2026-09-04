@@ -1,10 +1,9 @@
 <template>
   <div class="dashboard">
     <h1>Dashboard</h1>
-    <div v-if="user">
-      <img :src="user.picture" alt="User Icon" style="max-width:100px; border-radius:50%;">
-      <p><strong>Email:</strong> {{ user.email }}</p>
-      <p><strong>Name:</strong> {{ user.name }}</p>
+    <div v-if="authenticated">
+      <p>Authenticated</p>
+      <p><strong>Internal user ID:</strong> {{ internalUserId }}</p>
       <button @click="joinChat">Join Chat</button>
       <button @click="logout">Logout</button>
     </div>
@@ -23,31 +22,54 @@ export default {
   name: 'DashboardPage',
   setup() {
     const router = useRouter()
-    const user = ref(null)
+    const authenticated = ref(false)
+    const internalUserId = ref(null)
 
-    const fetchUser = async () => {
+    const fetchAuthentication = async () => {
       try {
-        const res = await apiClient.get('/api/me')
-        if (res && res.data && res.data.user) {
-          user.value = res.data.user
-        } else {
-          const errMsg = "No user info returned from API."
-          console.error("Error fetching user info:", errMsg)
-          router.push({ path: '/', query: { error: 'Authentication required' } })
+        const response = await apiClient.get('/api/me')
+        if (response.data?.authenticated === true) {
+          authenticated.value = true
+          internalUserId.value = response.data.internal_user_id
         }
-      } catch (e) {
-        console.error("Failed to fetch user info:", e)
-        router.push({ path: '/', query: { error: 'Authentication required' } })
+      } catch (error) {
+        if (error.response?.status === 401) {
+          router.replace('/')
+        }
       }
     }
 
+    const getCsrfToken = () => {
+      const cookieName = '__Host-portal_csrf='
+      const values = document.cookie
+        .split(';')
+        .map(cookie => cookie.trim())
+        .filter(cookie => cookie.startsWith(cookieName))
+        .map(cookie => cookie.slice(cookieName.length))
+
+      return values.length === 1 && values[0] ? values[0] : null
+    }
+
     const logout = async () => {
+      const csrfToken = getCsrfToken()
+      if (!csrfToken) {
+        return
+      }
+
       try {
-        await apiClient.post('https://auth.tororomeshi.net/auth/logout')
-      } catch (e) {
-        console.error("Logout failed:", e)
-      } finally {
-        window.location.href = '/'
+        const response = await apiClient.post('/logout', undefined, {
+          headers: {
+            'X-CSRF-Token': csrfToken
+          }
+        })
+
+        if (response.status === 204) {
+          authenticated.value = false
+          internalUserId.value = null
+          router.replace('/')
+        }
+      } catch (error) {
+        // Keep the current authentication state and dashboard on logout failure.
       }
     }
 
@@ -56,11 +78,12 @@ export default {
     }
 
     onMounted(() => {
-      fetchUser()
+      fetchAuthentication()
     })
 
     return {
-      user,
+      authenticated,
+      internalUserId,
       logout,
       joinChat
     }
@@ -74,10 +97,6 @@ export default {
   margin: 0 auto;
   padding: 2em;
   text-align: center;
-}
-img {
-  display: block;
-  margin: 0 auto 1em;
 }
 button {
   margin-top: 1em;
