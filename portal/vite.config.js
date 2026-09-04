@@ -10,9 +10,21 @@ export default defineConfig({
     },
   },
   server: {
-    port: 8080,
+    port: 5173,
     proxy: {
       '/api': {
+        target: process.env.BACKEND_URL || 'http://localhost:3000',
+        changeOrigin: true,
+      },
+      '/login': {
+        target: process.env.BACKEND_URL || 'http://localhost:3000',
+        changeOrigin: true,
+      },
+      '/auth/callback': {
+        target: process.env.BACKEND_URL || 'http://localhost:3000',
+        changeOrigin: true,
+      },
+      '/logout': {
         target: process.env.BACKEND_URL || 'http://localhost:3000',
         changeOrigin: true,
       },
