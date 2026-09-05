@@ -106,3 +106,30 @@ T09〜T12により、production configuration boundary、Google/Redis/PostgreSQL
 T13〜T15により、`portal_backend` 単体の認証経路が成立したことを人間が承認した。LoginStart / LocalSessionはprocess memoryで管理し、LoginStartのone-shot claim、handoffの自動retryなし、LocalSessionのみを認可根拠とする保護API、portalローカルログアウトのCSRF、JWT runtime認証の削除、および同一オリジンのbackend route境界を確認済みである。
 
 独立レビュー結果は `APPROVE`、T15 commit可能およびGate C進行可能であり、25 tests、`cargo fmt --check`、`cargo check --locked`、`cargo test --locked`、`git diff --check` はすべてPASSである。次の作業はT16/T17およびT18とする。
+
+## 13. T19本番routing・Secret・NetworkPolicy固定値
+
+現行production edgeはCloudflare TunnelからKubernetes Serviceへ直接到達する。`portal.tororomeshi.net` は `frontend-service.auth0.svc.cluster.local:80`、`auth.tororomeshi.net` は `rust-auth0-service.auth0.svc.cluster.local:8080` が転送先であり、portal/authのKubernetes Ingressを経由しない。clusterに`cloudflared` IngressClass/controllerはない。したがって `portal/k8s/ingress.yaml` と `rust-auth0-service/yaml/ingress.yaml` のpath ruleをcurrent production routing enforcementの根拠にしない。
+
+T19のproduction portal routing planeは `Cloudflare Tunnel -> frontend-service -> frontend Nginx` とする。frontend Nginxはexact matchの`/login`、`/auth/callback`、`/logout`と、末尾slashなしの`/api`および`/api/*`だけを`portal-backend-service:3000`へproxyする。既存の`location /api/`に加えて`/api`もbackendへ到達させ、`/login/*`や`/logout/*`へ範囲を広げない。`/`、SPA route、static fileはfrontend自身が処理する。T19で `portal/k8s/ingress.yaml`、Cloudflare設定、Ingress controller、path-aware Cloudflare routingを変更しない。
+
+本番portal_backendの通常設定とSecret参照は次に固定する。
+
+| 項目 | 固定値 |
+|---|---|
+| namespace | `auth0` |
+| service ID | `PORTAL_SERVICE_ID=portal-prod` |
+| 認証基盤URL | `PORTAL_AUTH_FOUNDATION_BASE_URL=https://auth.tororomeshi.net` |
+| Secret resource | `portal-prod-service-secret` |
+| Secret key | `service_secret` |
+| consumer env | `PORTAL_SERVICE_SECRET` |
+
+`backend-config`は通常設定2値だけを持ち、旧`NODE_ENV`、`PORT`、`FRONTEND_URL`は除去する。`PORT=3000`はDeploymentの既存literal値を維持する。Deploymentは`replicas: 1`、`strategy.type: Recreate`とし、旧`FRONTEND_URL`および`JWT_SECRET`/`uniauth-secrets`参照を削除する。LoginStartとLocalSessionはprocess memoryであるため、新旧Podを並存させない。
+
+T19は `PORTAL_SERVICE_SECRET` を `secretKeyRef` のname `portal-prod-service-secret`、key `service_secret`へ配線するだけで、実Secret値、fake secret、plaintextを作成・commitしない。T21でportal-prodの平文service_secretを生成し、そのSHA-256検証値を`registered_web_services`へ登録し、同じ平文を`auth0/portal-prod-service-secret`のkey `service_secret`としてcutover成果物へ配置する。具体的なscript/file名はT21実装時に既存の管理方式へ合わせて決める。production Kubernetesへportal-devまたはportal-dev用Secretを置かず、developmentはT17/local設定に限定する。
+
+portal_backendのNetworkPolicyは `podSelector.matchLabels.app: portal-backend` とする。ingressは同一namespaceの`app: frontend`からTCP 3000だけを許可し、`app: backend`自己許可やCloudflare Podからの直接許可を作らない。egressは、namespace `kube-system`かつ`k8s-app: kube-dns`へのUDP/TCP 53と、`ipBlock.cidr: 0.0.0.0/0`へのTCP 443だけを許可し、TCP 5432と6379のallow ruleを作らない。portal_backendはDB/Redis client自体を持たない。対象Podへ別のallow-allまたは加算的egress policyが存在しないことをT19で再確認する。
+
+この標準NetworkPolicyが保証するのはDNSおよびTCP/443 outboundが可能で、PostgreSQL TCP/5432とRedis TCP/6379を許可しないことまでである。FQDN、TLS SNI、HTTP pathを認識しないため、`auth.tororomeshi.net`または`/auth/handoffs/exchange`専用とは主張しない。Cloudflare CIDR列挙はこの制約を解消せず外部可変設定を増やすため採用しない。接続先の真正性は `PORTAL_AUTH_FOUNDATION_BASE_URL=https://auth.tororomeshi.net` に対するreqwest/rustlsのTLS certificate・hostname検証で確保し、handoff交換の認可はHTTP Basicの`service_id=portal-prod`とservice_secretで確保する。平文service_secretを持つのはportal_backendだけとし、frontend/browserへ渡さない。
+
+auth hostもCloudflare Tunnelからrust-auth0-serviceへ直接到達するため、T18のIngress path restrictionはcurrent production enforcementではない。T19ではauth側routingを変更せず、T20でlegacy Rust route/sourceを削除する。Gate Dはdead Ingress ruleの存在ではなく、portalの実経路とT20後のauth側actual route集合を検証する。T26は承認済み成果物を一括適用し、既存のCloudflare TunnelからServiceへのedge構成のまま新経路を公開する。

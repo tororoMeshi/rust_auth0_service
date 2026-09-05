@@ -12,7 +12,9 @@
 
 現行の `rust-auth0-service/src/main.rs` は `/auth/google` とGoogle callbackを持ち、親ドメインCookie、任意redirect、`uniauth` HTTP clientに依存する。`uniauth/src/main.rs` は `users`、Redis JSONセッション、JWT、`/upsert_and_token`、`/sessions/verify`、旧`/logout`を持つ。`portal_backend/src/main.rs` はJWT Cookieを検証し、`portal/vite.config.js` は `/api` だけをproxyしている。
 
-配置対象は主に `rust-auth0-service/yaml/deploy.yaml`、`rust-auth0-service/yaml/ingress.yaml`、`uniauth/yaml/deploy.yaml`、`portal_backend/k8s/deploy.yaml`、`portal_backend/k8s/backend-networkpolicy.yaml`、`portal/k8s/ingress.yaml` である。PostgreSQLとRedisの既存配置候補は `postgres/` と `redis/create_redis.yaml` にある。新しいmigration、Lua、移行手順、テストの具体的な配置はT01で現在の管理方式に照らして確定する。
+配置対象は主に `rust-auth0-service/yaml/deploy.yaml`、`rust-auth0-service/yaml/ingress.yaml`、`uniauth/yaml/deploy.yaml`、`portal/k8s/frontend-configmap.yaml`、`portal_backend/k8s/deploy.yaml`、`portal_backend/k8s/backend-networkpolicy.yaml`、`portal_backend/k8s/backend-configmap.yaml` である。PostgreSQLとRedisの既存配置候補は `postgres/` と `redis/create_redis.yaml` にある。新しいmigration、Lua、移行手順、テストの具体的な配置はT01で現在の管理方式に照らして確定する。
+
+現行production edgeではCloudflare Tunnelがportal hostを`frontend-service.auth0.svc.cluster.local:80`へ、auth hostを`rust-auth0-service.auth0.svc.cluster.local:8080`へ直接転送し、Kubernetes Ingressを経由しない。clusterに`cloudflared` IngressClass/controllerはなく、portal/authのIngress path ruleをproduction routing enforcementの根拠にしない。
 
 ## 3. 依存関係とGate
 
@@ -61,7 +63,9 @@ Gate D → T21 → T22 → T23 → T24 → T25 → Gate E → T26
 
 ### Gate D: 新構成統合成立
 
-- Ingress、Secret、Deployment、NetworkPolicyが新経路だけを許可する。
+- portalの実経路 `Cloudflare Tunnel -> frontend-service -> frontend Nginx -> portal_backend` が所定のpathだけをbackendへ渡すことを確認する。dead Kubernetes Ingress ruleの存在だけを証拠にしない。
+- auth hostはrust-auth0-serviceへ直接到達し、T20後のactual source route集合がnew auth routesだけである。
+- SecretKeyRef契約、Deployment、NetworkPolicyがT19の固定値と境界を満たす。
 - `rust-auth0-service` は1 replica、`portal_backend` は1 replicaかつ `Recreate` である。
 - uniauth、JWT、旧API、親ドメインCookie、旧Redis JSONセッション、不要依存が残っていない。
 - PostgreSQLとRedisはIngressへ公開されていない。
@@ -606,14 +610,15 @@ T12が完了している。
 - rust-auth0-serviceを1 replicaにし、auth host、Google callback URI、PostgreSQL・Redis・Google Secretだけを設定する。
 - `JWT_SECRET`、uniauth URL、親ドメインCookie、任意redirect設定を削除する。
 - PostgreSQLとRedisをIngressへ公開しないことを確認する。
+- auth hostのCloudflare Tunnelはrust-auth0-serviceへ直接到達する。T18で新しいIngress controllerやCloudflare routingを追加せず、Ingress path restrictionをcurrent production enforcementとして扱わない。
 
 **検証**
 
-- manifestレビューでreplica、公開host、不要環境変数、Ingress公開範囲を確認する。
+- manifestレビューでreplica、公開host、不要環境変数、Ingress公開範囲を確認する。ただしproduction routingはCloudflare Tunnelの実転送先も確認し、Ingress ruleだけで判定しない。
 
 **完了条件**
 
-- auth hostはrust-auth0-serviceの新経路だけを公開する。
+- auth hostはrust-auth0-serviceへ到達する。new auth routesだけへの限定はIngressではなく、T20でlegacy Rust route/sourceを削除したactual route集合によってGate Dまでに成立させる。
 
 ### T19. portal Kubernetes経路と配備条件の切替
 
@@ -627,25 +632,34 @@ T15、T17、T18が完了している。
 
 **主な変更対象**
 
-- `portal/k8s/ingress.yaml`
+- `portal/k8s/frontend-configmap.yaml`
 - `portal_backend/k8s/deploy.yaml`
 - `portal_backend/k8s/backend-networkpolicy.yaml`
 - `portal_backend/k8s/backend-configmap.yaml`
 
 **実施内容**
 
-- portal hostの`/login`、`/auth/callback`、`/logout`、`/api/*`をportal_backendへ、残りをportalへroutingする。
-- 本番Kubernetesのportal_backendを1 replica・`Recreate`にし、`service_id = portal-prod`、portal-prod用service_secret、本番認証基盤URLだけを渡す。ローカル開発環境には `service_id = portal-dev`、portal-dev用service_secret、開発用認証基盤URLだけを設定する。
-- JWT_SECRET、uniauth URL、親ドメインCookie設定を削除する。
-- NetworkPolicyについてDNS、auth hostのHTTPS、TLS/SNI、handoff交換到達性を確認し必要最小限に更新する。
+- production portal routing planeを `Cloudflare Tunnel -> frontend-service -> frontend Nginx` に固定する。frontend Nginxはexact matchの`/login`、`/auth/callback`、`/logout`と、`/api`および`/api/*`だけを`portal-backend-service:3000`へproxyする。既存`location /api/`に末尾slashなしの`/api`を加え、`/login/*`や`/logout/*`へ広げない。`/`、SPA route、static fileはfrontend自身で処理する。
+- portal_backendを`replicas: 1`・`strategy.type: Recreate`とし、process memoryのLoginStart/LocalSessionを持つ新旧Podを並存させない。
+- `backend-config`を`PORTAL_SERVICE_ID=portal-prod`と`PORTAL_AUTH_FOUNDATION_BASE_URL=https://auth.tororomeshi.net`だけへ置換する。旧`NODE_ENV`、`PORT`、`FRONTEND_URL`をConfigMapから除去し、`PORT=3000`はDeploymentの既存literal値を維持する。
+- Deploymentの`PORTAL_SERVICE_SECRET`をnamespace `auth0`のSecret `portal-prod-service-secret`、key `service_secret`への`secretKeyRef`で配線する。旧`FRONTEND_URL`と`JWT_SECRET`設定、および`uniauth-secrets`の`jwt_secret` `SecretKeyRef`を削除する。T19では実Secret値やfake secretを作らず、plaintextをcommitしない。
+- production Kubernetesへportal-devまたはportal-dev用Secretを置かない。developmentはT17/local設定を使用する。
+- NetworkPolicy selectorを`app: portal-backend`へ修正し、ingressは同一namespaceの`app: frontend`からTCP 3000だけを許可する。`app: backend`自己許可とCloudflare Podからの直接許可は作らない。
+- egressはnamespace `kube-system`かつ`k8s-app: kube-dns`へのUDP/TCP 53と、`ipBlock.cidr: 0.0.0.0/0`へのTCP 443だけを許可する。portal_backendはDB/Redis client自体を持たず、TCP 5432/6379のallow ruleを作らない。
+- T19で `portal/k8s/ingress.yaml`、Cloudflare設定、legacy Rust routeを変更せず、新しいIngress controller、service mesh、egress proxy、FQDN NetworkPolicy製品、Cloudflare CIDR管理を追加しない。
 
 **検証**
 
-- path routing、Recreate、Secret参照、DNS/HTTPS到達性、DB・Redis非公開を配置検証する。
+- actual production chainでNginxのexact 3 path、`/api`、`/api/*`だけがbackendへ届き、`/login/*`、`/logout/*`、SPA route、static fileがbackendへ広がらないことを確認する。dead Ingress ruleだけをrouting成立の証拠にしない。
+- 1 replica/Recreate、通常設定2値、`PORT=3000` literal、SecretKeyRef、旧env削除をmanifestで確認する。
+- NetworkPolicyのselector、frontendだけのingress、DNSとTCP/443のegressを確認する。TCP/5432 PostgreSQLとTCP/6379 Redisのallow rule、および対象Podへ適用される別のallow-all/additive egress policyがないことを確認する。
+- `PORTAL_AUTH_FOUNDATION_BASE_URL`に対するreqwest/rustlsのTLS certificate・hostname検証、HTTP Basicの`service_id=portal-prod`とservice_secret、および平文secretをportal_backendだけが持つことを確認する。
 
 **完了条件**
 
-- portal_backendだけが認証基盤の交換endpointへ到達し、共有DB・Redisへは到達しない。portal-dev用Secretを本番クラスタへ配置しない。
+- portalのactual production chain、配備設定、Secret参照、NetworkPolicyが固定値どおりであり、portal-dev用Secretを本番clusterへ配置しない。
+- NetworkPolicyの保証はportal_backendからDNSとTCP/443 outboundが可能で、TCP/5432とTCP/6379を許可しないことまでとする。標準NetworkPolicyはFQDN、TLS SNI、HTTP pathを認識しないため、auth hostまたはhandoff endpoint専用とは主張しない。
+- 認証先の真正性・認可はTLS certificate/hostname検証とHTTP Basicのportal-prod資格情報を合わせて成立させ、frontend/browserへservice_secretを渡さない。
 
 ### T20. 旧uniauth・JWT・旧APIの完全削除
 
@@ -673,6 +687,7 @@ T16–T19が完了している。
 - `/auth/google`、任意redirect、`ALLOWED_REDIRECT_ORIGINS`、`POST_LOGIN_REDIRECT`、`/upsert_and_token`、`/sessions/verify`、旧`/logout`を削除する。
 - JWT発行・検証・JWT_SECRET、親ドメインCookie、旧Redis JSONセッション、rust-auth0-serviceからuniauthへのHTTP client、uniauth実行バイナリ・Deployment・Service・不要crate依存を削除する。
 - コメントアウト、feature flag、互換API、fallbackとして残さない。
+- auth hostはCloudflare Tunnelからrust-auth0-serviceへ直接到達するため、legacy Rust route/sourceの削除をactual production route集合のenforcementとする。T20でCloudflare設定を変更しない。
 - 新しい一括切替リリース内で旧経路が存在しない状態をリポジトリ上で作り、統合検証とリハーサルを行う。現在稼働中の旧本番環境はT26まで変更しない。
 - T18、T19、T20の成果物を個別に本番へ順次適用せず、本番への新マニフェスト適用、uniauth停止、旧API停止はT26の一括切替で同時に行う。
 - T01でロールバック元情報が固定されていなければ、旧コードや旧マニフェストを削除しない。T20でリポジトリから旧構成を削除しても、T01に記録した不変image digest、Kubernetes構成、旧マニフェストの所在、設定・Secret参照から旧構成を復元するための基準を維持する。
@@ -704,7 +719,7 @@ Gate Dを通過し、T04で管理場所を確定している。
 **実施内容**
 
 - 現行users事前検査、usersから`internal_users`への変換、usersから`external_identities`への変換、件数・ID・外部ID検査、identity sequence調整、旧users削除を、一括切替専用のSQLまたは手順として作成する。
-- `registered_web_services`初期登録、service_secret生成、旧Redisキー安全識別・削除、PostgreSQLバックアップ・復元確認、旧Cookie失効、ロールバック用の新しいJWT_SECRET生成の成果物を作成する。
+- `registered_web_services`初期登録、service_secret生成、旧Redisキー安全識別・削除、PostgreSQLバックアップ・復元確認、旧Cookie失効、ロールバック用の新しいJWT_SECRET生成の成果物を作成する。portal-prodのservice_secretはSHA-256検証値を`registered_web_services`へ登録し、同じ平文を`auth0/portal-prod-service-secret`のkey `service_secret`としてcutover成果物へ配置する。具体的なscript/file名はT21実装時に既存管理方式へ合わせて決める。
 - T01で記録したイメージdigestを再確認し、T01で記録した不変image digest、Kubernetes構成、旧マニフェストの所在、設定・Secret参照をロールバック成果物として固定する。必要なイメージがレジストリからpull可能であることを確認する。
 - T01で記録した設定参照を使い、ロールバック用の新しいJWT_SECRETを組み込む手順と、旧構成を不変な成果物から再配備するチェックリストを作成する。可変タグだけをロールバック根拠にせず、T21で稼働中Podを唯一の情報源として初めてdigestを取得しない。
 - 一括切替チェックリストを作成し、SQL本文やShell本文を本タスクリストへ転記しない。
@@ -817,13 +832,14 @@ T21–T24が完了している。
 
 - `rust-auth0-service/yaml/deploy.yaml`
 - `rust-auth0-service/yaml/ingress.yaml`
-- `portal/k8s/ingress.yaml`
+- `portal/k8s/frontend-configmap.yaml`
 - `portal_backend/k8s/deploy.yaml`
 - `portal_backend/k8s/backend-networkpolicy.yaml`
+- `portal_backend/k8s/backend-configmap.yaml`
 
 **実施内容**
 
-- 1 replica、Recreate、Ingress path、Secret、NetworkPolicy、DB・Redis非公開を配置検証する。
+- 1 replica、Recreate、Secret、NetworkPolicy、DB・Redis非公開と、`Cloudflare Tunnel -> frontend-service -> frontend Nginx -> portal_backend`のactual portal chainを配置検証する。Ingress path ruleの存在だけをroutingの証拠にせず、auth側はT20後のactual route集合を確認する。
 - T21のバックアップ、データ変換、登録、旧状態失効、復元確認、ロールバック手順を一括移行リハーサルで検証する。
 - 旧イメージdigestを使った全体ロールバック、新しいロールバック用JWT_SECRETで旧JWT認証機能が起動すること、移行前JWTが新しいJWT_SECRETで拒否されること、ロールバック後も全利用者へ再ログインを要求することを確認する。
 
@@ -854,6 +870,7 @@ Gate Eを通過している。
 **実施内容**
 
 - T21の一括切替チェックリストを順に実行し、バックアップ、migration、初期登録、配備、旧状態無効化、公開後確認を行う。
+- T18〜T20の承認済み成果物を一括適用し、Cloudflare TunnelからServiceへの既存edge構成のまま新経路を公開する。T26でCloudflare routingを再設計しない。
 - 問題時はT21で定義した全体ロールバックだけを行い、部分互換や二重運用を開始しない。
 - T26実施中に新しいコード、SQL、Lua、YAMLをその場で修正しない。問題が見つかった場合は作業を止め、承認済みの全体ロールバックを行う。
 
