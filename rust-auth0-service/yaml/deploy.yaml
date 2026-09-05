@@ -35,7 +35,7 @@ spec:
           # 現在の本番値。流用時は差し替える
           - name: GOOGLE_REDIRECT_URI
             value: "https://auth.tororomeshi.net/auth/google/callback"
-          # Redis session store
+          # Auth foundation Redis connection
           - name: REDIS_URL
             value: "redis://rfrm-redisfailover:6379"
           # Auth foundation PostgreSQL connection
@@ -55,9 +55,3 @@ spec:
               secretKeyRef:
                 name: auth0-app-user.auth0-account-db.credentials.postgresql.acid.zalan.do
                 key: password
-          # session-secret / SESSION_SECRET_KEY
-          - name: SESSION_SECRET_KEY
-            valueFrom:
-              secretKeyRef:
-                name: session-secret
-                key: SESSION_SECRET_KEY

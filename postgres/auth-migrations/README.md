@@ -2,7 +2,7 @@
 
 ## 所有者
 
-認証基盤の通常 schema migration は `postgres/auth-migrations/` が所有します。`rust-auth0-service` と `uniauth` は migration を実行しません。`uniauth` は将来の廃止対象であり、migration 所有者ではありません。
+認証基盤の通常 schema migration は `postgres/auth-migrations/` が所有します。`rust-auth0-service` は migration を実行しません。旧 `uniauth` も migration 所有者ではありませんでした。
 
 ## 通常 migration
 

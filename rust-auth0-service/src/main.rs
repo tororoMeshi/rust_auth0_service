@@ -4,17 +4,15 @@
 // T02で定義し、後続の認証タスクから順次接続する。
 #[allow(dead_code)]
 mod auth_foundation;
+// These modules expose helpers used by the integration-style tests in this binary.
+#[allow(unused_imports)]
 mod postgres;
+#[allow(dead_code)]
 mod redis_state;
 
-#[allow(unused_imports)]
-use actix_cors::Cors;
-#[allow(unused_imports)]
 use actix_web::http::header;
 
-use actix_session::storage::RedisSessionStore;
-use actix_session::{Session, SessionMiddleware};
-use actix_web::cookie::{time::Duration, Cookie, Key, SameSite};
+use actix_web::cookie::{time::Duration, Cookie, SameSite};
 use actix_web::middleware::DefaultHeaders;
 use actix_web::{get, web, App, HttpRequest, HttpResponse, HttpServer};
 use base64::engine::general_purpose::STANDARD;
@@ -27,7 +25,6 @@ use oauth2::{
     basic::BasicClient, AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, RedirectUrl,
     Scope, TokenUrl,
 };
-use rand::{distributions::Alphanumeric, Rng};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
@@ -56,13 +53,6 @@ const GOOGLE_AUTHORIZATION_URL: &str = "https://accounts.google.com/o/oauth2/aut
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GOOGLE_USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v1/userinfo?alt=json";
 const HTTP_BODY_MAX_BYTES: usize = 16_384;
-
-#[derive(Clone)]
-struct AppConfig {
-    google_client_id: String,
-    google_redirect_uri: String,
-    uniauth_url: String,
-}
 
 #[derive(Clone)]
 struct GoogleAuthorizationConfig {
@@ -128,144 +118,6 @@ fn required_nonempty_env(name: &str) -> io::Result<String> {
     }
 
     Ok(value)
-}
-
-fn required_env(name: &str) -> io::Result<String> {
-    env::var(name).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{name} environment variable is required"),
-        )
-    })
-}
-
-fn app_base_url() -> String {
-    env::var("APP_BASE_URL")
-        .unwrap_or_else(|_| "http://localhost:8080".to_string())
-        .trim_end_matches('/')
-        .to_string()
-}
-
-fn split_csv_env(name: &str) -> Vec<String> {
-    env::var(name)
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.trim_end_matches('/').to_string())
-        .collect()
-}
-
-fn allowed_redirect_origins() -> Vec<String> {
-    let mut origins = split_csv_env("ALLOWED_REDIRECT_ORIGINS");
-    let base_url = app_base_url();
-
-    if !origins.iter().any(|origin| origin == &base_url) {
-        origins.push(base_url);
-    }
-
-    origins
-}
-
-fn allowed_cors_origins() -> Vec<String> {
-    let origins = split_csv_env("ALLOWED_CORS_ORIGINS");
-
-    if origins.is_empty() {
-        allowed_redirect_origins()
-    } else {
-        origins
-    }
-}
-
-fn post_login_redirect() -> String {
-    env::var("POST_LOGIN_REDIRECT").unwrap_or_else(|_| format!("{}/", app_base_url()))
-}
-
-fn cookie_domain() -> Option<String> {
-    env::var("COOKIE_DOMAIN")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-fn is_allowed_absolute_redirect(raw_redirect: &str, allowed_origin: &str) -> bool {
-    if raw_redirect == allowed_origin {
-        return true;
-    }
-
-    raw_redirect
-        .strip_prefix(allowed_origin)
-        .and_then(|rest| rest.chars().next())
-        .is_some_and(|next| matches!(next, '/' | '?' | '#'))
-}
-
-fn is_allowed_post_login_redirect(raw_redirect: &str, allowed_origins: &[String]) -> bool {
-    if raw_redirect.starts_with('/') && !raw_redirect.starts_with("//") {
-        return true;
-    }
-
-    allowed_origins
-        .iter()
-        .any(|origin| is_allowed_absolute_redirect(raw_redirect, origin))
-}
-
-fn validate_post_login_redirect(raw_redirect: &str, allowed_origins: &[String]) -> io::Result<()> {
-    if is_allowed_post_login_redirect(raw_redirect, allowed_origins) {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "POST_LOGIN_REDIRECT must match one of the allowed redirect origins or a relative path: {raw_redirect}"
-            ),
-        ))
-    }
-}
-
-fn resolve_redirect_url(raw_redirect: &str) -> String {
-    let base_url = app_base_url();
-
-    if raw_redirect.starts_with('/') && !raw_redirect.starts_with("//") {
-        return format!("{}{}", base_url, raw_redirect);
-    }
-
-    if allowed_redirect_origins()
-        .iter()
-        .any(|origin| is_allowed_absolute_redirect(raw_redirect, origin))
-    {
-        return raw_redirect.to_string();
-    }
-
-    post_login_redirect()
-}
-
-fn build_auth_cookie(name: &'static str, value: String) -> Cookie<'static> {
-    let mut builder = Cookie::build(name, value)
-        .path("/")
-        .http_only(true)
-        .secure(true)
-        .same_site(SameSite::Strict);
-
-    if let Some(domain) = cookie_domain() {
-        builder = builder.domain(domain);
-    }
-
-    builder.finish()
-}
-
-fn build_expired_auth_cookie(name: &'static str) -> Cookie<'static> {
-    let mut builder = Cookie::build(name, "")
-        .path("/")
-        .max_age(Duration::seconds(0))
-        .http_only(true)
-        .secure(true)
-        .same_site(SameSite::Strict);
-
-    if let Some(domain) = cookie_domain() {
-        builder = builder.domain(domain);
-    }
-
-    builder.finish()
 }
 
 #[derive(Deserialize)]
@@ -502,52 +354,6 @@ async fn login(
         .append_pair("state", &query.state);
     HttpResponse::Found()
         .append_header((header::LOCATION, callback_url.to_string()))
-        .finish()
-}
-
-// クエリパラメータ用構造体
-#[derive(Debug, Deserialize)]
-struct StartAuthQuery {
-    redirect: Option<String>,
-}
-
-// Google OAuth 認証開始エンドポイント
-#[get("/auth/google")]
-async fn start_google_auth(
-    session: Session,
-    query: web::Query<StartAuthQuery>,
-    config: web::Data<AppConfig>,
-) -> HttpResponse {
-    // CSRF 対策用の state を生成しセッションに保存
-    let state: String = rand::thread_rng()
-        .sample_iter(&Alphanumeric)
-        .take(16)
-        .map(char::from)
-        .collect();
-    if let Err(_) = session.insert("oauth_state", state.clone()) {
-        error!("Failed to store OAuth request data in legacy session");
-        return HttpResponse::InternalServerError()
-            .body("Internal server error: cannot set oauth_state");
-    }
-
-    // ログイン前のリダイレクト先をセッションに保存
-    if let Some(ref redirect) = query.redirect {
-        if let Err(_) = session.insert("redirect", redirect) {
-            error!("Failed to store redirect in legacy session");
-            return HttpResponse::InternalServerError()
-                .body("Internal server error: cannot set redirect");
-        }
-    }
-
-    // Google OAuth 認可 URL を生成
-    let auth_url = format!(
-        "https://accounts.google.com/o/oauth2/auth?response_type=code&client_id={}&redirect_uri={}&scope=email%20profile&access_type=offline&prompt=consent&state={}",
-        config.google_client_id, config.google_redirect_uri, state
-    );
-    info!("redirecting to Google authorization endpoint");
-
-    HttpResponse::Found()
-        .append_header(("Location", auth_url))
         .finish()
 }
 
@@ -918,10 +724,6 @@ async fn main() -> std::io::Result<()> {
     dotenv().ok();
     env_logger::init();
 
-    // CORS の設定
-    use actix_cors::Cors;
-    use actix_web::http::header;
-
     let auth_foundation_config = AuthFoundationConfig::from_env()?;
 
     let postgres_options = PgConnectOptions::new()
@@ -956,11 +758,6 @@ async fn main() -> std::io::Result<()> {
         })?;
     info!("Redis connection established");
 
-    let config = AppConfig {
-        google_client_id: auth_foundation_config.google_client_id.clone(),
-        google_redirect_uri: auth_foundation_config.google_redirect_uri.clone(),
-        uniauth_url: env::var("UNIAUTH_URL").unwrap_or_else(|_| "http://uniauth:8081".to_string()),
-    };
     let google_authorization_config = GoogleAuthorizationConfig {
         client_id: auth_foundation_config.google_client_id.clone(),
         redirect_uri: RedirectUrl::new(auth_foundation_config.google_redirect_uri.clone())
@@ -991,51 +788,14 @@ async fn main() -> std::io::Result<()> {
         userinfo_url: reqwest::Url::parse(GOOGLE_USERINFO_URL).expect("valid URL"),
     });
 
-    let allowed_redirect_origins = allowed_redirect_origins();
-    let post_login_redirect = post_login_redirect();
-    validate_post_login_redirect(&post_login_redirect, &allowed_redirect_origins)?;
-
-    // RedisSessionStore の初期化
-    let redis_store = RedisSessionStore::new(auth_foundation_config.redis_url.clone())
-        .await
-        .map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::ConnectionRefused,
-                "failed to create legacy Redis session store",
-            )
-        })?;
-
     drop(auth_foundation_config);
 
-    // セッション Cookie 署名用の秘密鍵
-    let secret_key = required_env("SESSION_SECRET_KEY")?;
-
     HttpServer::new(move || {
-        let mut cors = Cors::default()
-            .allowed_methods(vec!["GET", "POST", "OPTIONS"])
-            .allowed_headers(vec![
-                header::AUTHORIZATION,
-                header::ACCEPT,
-                header::CONTENT_TYPE,
-            ])
-            .supports_credentials();
-
-        for origin in allowed_cors_origins() {
-            cors = cors.allowed_origin(&origin);
-        }
-
         App::new()
-            .wrap(cors)
-            .app_data(web::Data::new(config.clone()))
             .app_data(web::Data::new(google_authorization_config.clone()))
             .app_data(google_callback_config.clone())
             .app_data(web::Data::new(postgres_pool.clone()))
             .app_data(web::Data::new(redis_connection.clone()))
-            .app_data(web::Data::new(redis_store.clone()))
-            .wrap(SessionMiddleware::new(
-                redis_store.clone(),
-                Key::from(secret_key.as_bytes()),
-            ))
             .service(
                 web::scope("")
                     .wrap(auth_security_headers())
@@ -1053,7 +813,6 @@ async fn main() -> std::io::Result<()> {
                             .route(web::post().to(logout_post)),
                     ),
             )
-            .service(start_google_auth)
     })
     .bind("0.0.0.0:8080")?
     .run()
@@ -3302,32 +3061,5 @@ mod tests {
             .query_async::<()>(&mut connection)
             .await
             .expect("cleanup Redis state");
-    }
-
-    #[test]
-    fn post_login_redirect_accepts_relative_path() {
-        let allowed = vec!["https://portal.example.com".to_string()];
-        assert!(is_allowed_post_login_redirect("/dashboard", &allowed));
-    }
-
-    #[test]
-    fn post_login_redirect_accepts_allowed_absolute_url() {
-        let allowed = vec!["https://portal.example.com".to_string()];
-        assert!(is_allowed_post_login_redirect(
-            "https://portal.example.com/dashboard",
-            &allowed
-        ));
-    }
-
-    #[test]
-    fn post_login_redirect_rejects_disallowed_absolute_url() {
-        let allowed = vec!["https://portal.example.com".to_string()];
-        assert!(!is_allowed_post_login_redirect(
-            "https://evil.example.com/dashboard",
-            &allowed
-        ));
-        assert!(
-            validate_post_login_redirect("https://evil.example.com/dashboard", &allowed).is_err()
-        );
     }
 }
