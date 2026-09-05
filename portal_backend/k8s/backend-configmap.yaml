@@ -4,6 +4,5 @@ metadata:
   name: backend-config
   namespace: auth0
 data:
-  NODE_ENV: "production"
-  PORT: "3000"
-  FRONTEND_URL: "http://frontend-service"
+  PORTAL_SERVICE_ID: "portal-prod"
+  PORTAL_AUTH_FOUNDATION_BASE_URL: "https://auth.tororomeshi.net"

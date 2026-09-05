@@ -7,6 +7,8 @@ metadata:
   namespace: auth0
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: portal-backend
@@ -22,16 +24,21 @@ spec:
           env:
             - name: PORT
               value: "3000"
-            - name: FRONTEND_URL
+            - name: PORTAL_SERVICE_ID
               valueFrom:
                 configMapKeyRef:
                   name: backend-config
-                  key: FRONTEND_URL
-            - name: JWT_SECRET
+                  key: PORTAL_SERVICE_ID
+            - name: PORTAL_AUTH_FOUNDATION_BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: backend-config
+                  key: PORTAL_AUTH_FOUNDATION_BASE_URL
+            - name: PORTAL_SERVICE_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: uniauth-secrets
-                  key: jwt_secret
+                  name: portal-prod-service-secret
+                  key: service_secret
             - name: RUST_LOG
               value: "info"
           ports:
