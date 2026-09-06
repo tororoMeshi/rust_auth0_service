@@ -29,6 +29,8 @@
 
 ## 3. 事前検査
 
+T21 を開始する前に、legacy uniauth JWT を直接検証する `stateless-chat/nodejs-room`、`stateless-chat/websocket-chat-api`、`jamaica/play-matching`、`jamaica/matchmaking` の各 workload について、新 Auth Foundation への移行完了または T26 前の明示的廃止のいずれかを完了する。新 Auth Foundation は legacy JWT を発行せず、既存 JWT の互換発行および generic JWT compatibility layer は採用しない。この consumer resolution は final Gate D の先行条件であり、未完了の間は T21 implementation readiness を BLOCKED とする。
+
 切替開始前に、PostgreSQL の切替前バックアップ取得方法と同じバックアップからの復元手順を、対象環境で確認する。復元安全性について、認証データが専用データベースまたは専用スキーマに分離されていること、または復元対象範囲へ書き込むすべてのコンポーネントを停止していることのいずれかを保証する。認証以外の処理が同じ復元対象へ書き込み続けている状態で PostgreSQL バックアップを復元しない。復元によって認証以外のデータを巻き戻す可能性がある場合は、一括切替を開始しない。部分的な新旧認証移行や二重書込みによってこの問題を回避しない。既存 `users` 件数を記録し、切替用 DDL、変換手順、Redis Lua の検証を完了する。実行可能な移行 SQL、Redis 削除スクリプト、Lua 本文は本書には記載しない。
 
 `users` の事前検査では、対象件数、最小・最大 `users.id`、ID の NULL・非正・重複、同じユーザー行の重複、`google_id` の NULL・空文字・重複を検査する。`google_id` は trim 後の空文字も異常として扱う。変換対象件数、作成予定の `internal_users` 件数、作成予定の `external_identities` 件数が元 `users` 件数と一致することも検査する。異常が一件でもあれば仮値で補完せず、移行を開始せずに事前修正を必要とする。
@@ -37,7 +39,9 @@
 
 サービス登録について、`portal` と `portal_backend` の本番・開発それぞれの `service_id`、login callback URI、logout 後 URI、認証サービス URL、Google callback URI を実環境設定と照合する。初回登録では、(1) `service_secret` を生成して Web サービスの Secret 管理領域へ配置し、(2) `registered_web_services` へ SHA-256 検証値と完全一致 URI を `is_enabled = false`で登録し、(3) Web サービス側の Secret、`service_id`、callback URI、logout 後 URI の設定値を静的に照合し、(4) 認証基盤側と Web サービス側の設定値が一致したことを確認し、(5) メンテナンス状態を維持したまま `is_enabled = true`へ変更し、(6) 移行済みの既存Googleアカウントで実際の疎通確認を行い、(7) 疎通確認成功後だけ一般利用を再開する。`is_enabled = false` の状態で実際のログインまたは handoff 交換を成功させる設計にはしない。疎通確認のための特別なエンドポイント、管理 API、feature flag は追加しない。平文 Secret を SQL、ログ、文書、URL、Cookie、フロントエンドに記載しない。管理画面、汎用管理 CLI、複数世代 Secret は追加せず、初回登録の最小手段だけを後続実装事項とする。
 
-Redis は現行の `rust-auth0-service` と `uniauth` がいずれも Redis URL を持つため、認証以外の用途と Redis 全体または DB 番号を共有していないかを確認する。共有している場合は `FLUSHDB` や `FLUSHALL` を使わず、旧認証キー prefix または識別可能な旧キーだけを削除する。削除対象を区別できない場合は、先に Redis の分離または安全な識別方法を整備し、切替を開始しない。
+Redis DB0 は authentication 専用ではなく shared である。確認済み consumer は少なくとも `auth0/rust-auth0-service`、`auth0/uniauth`、`stateless-chat/nodejs-room`、`stateless-chat/websocket-chat-api` である。forward migration と rollback の双方で `FLUSHDB` と `FLUSHALL` を使わず、安全に識別した旧 auth key だけを削除する。uniauth は prefix なし24文字 ASCII 英数字 key（string JSON、`user_id` / `expires_at`、TTL 約24h）、old rust-auth0-service Actix session は prefix なし64文字 ASCII 英数字 key（string JSON map、`oauth_state` 必須、`redirect` 任意、TTL 約24h）として識別する。新しい `auth:external:`、`auth:session:`、`auth:handoff:`、`auth:logout:` は forward 削除対象外である。分類不能 key が一件でもあれば削除せず cutover を停止し、推測・自動修復・自動削除をしない。
+
+production Redis は6.2.6だが canonical storage design は Redis 7+ である。T21 の blocker は、7+ が必要な機能的不変条件を確認して upgrade すること、または単なる選択 baseline なら minimum version requirement を再評価することのいずれかである。shared infrastructure の `redis:7.4.11-alpine` への upgrade は今回固定しない。
 
 次の全項目が満たされない限り一括切替を開始しない。
 
@@ -54,7 +58,9 @@ Redis は現行の `rust-auth0-service` と `uniauth` がいずれも Redis URL 
 
 同じユーザーごとに `external_identities` へ `provider = google`、`subject = users.google_id`、`internal_user_id = users.id`、`linked_at = 移行時刻` を一件作成する。`(provider, subject)` の一意性と、各 external identity が有効な internal user を参照することを検証する。email、name、image URL、Google トークン、Google 応答は新しい認証基盤 DB に保存しない。
 
-`internal_users.internal_user_id` は identity を持つ設計であるため、明示 ID を投入した後に identity sequence を既存最大 ID より後へ進める必要がある。これを実施しないと、将来の新規ユーザー作成が移行済み ID と衝突する。sequence 調整後に次の採番値が最大 `users.id` より大きいことを検証する。
+`internal_users.internal_user_id` は identity を持つ設計であるため、legacy user ID を再利用しない。writer 停止後に、次の採番値を `max(max(users.id) + 1, legacy users_id_seq の実 next value)` として設定する。現在の観測値は `max(users.id) = 36`、legacy sequence next = `125` であるため例示値は125だが、production script に125を hardcode しない。これを実施しないと、将来の新規ユーザー作成が移行済み ID と衝突する。sequence 調整後に次の採番値がこの high-water rule を満たすことを検証する。
+
+新 Auth Foundation runtime role `auth0_app_user` の grant は cutover 成果物で付与する。`internal_users` は `SELECT` / `INSERT`、`external_identities` は `SELECT` / `INSERT`、`registered_web_services` は `SELECT`、`internal_users` identity sequence は `USAGE` に限る。service registration / enable などの運用 write 権限は付与しない。既存 schema migration `001` を変更するかは、この時点で決めない。
 
 `registered_web_services` はデータ変換の副産物にせず、事前検査で確定した初期利用サービスをユーザーデータ変換とは別に一度だけ登録する。登録行には有効な `service_id`、完全一致の login callback URI、完全一致の logout 後 URI、SHA-256 の `service_secret` 検証値を持たせ、接続確認が終わるまでは `is_enabled = false` とする。Secret 平文は DB、ログ、文書、URL、Cookie、フロントエンドに保存しない。
 
@@ -66,7 +72,7 @@ Redis は現行の `rust-auth0-service` と `uniauth` がいずれも Redis URL 
 
 新 Redis の値は設計書どおりの Hash とし、認証基盤の短期状態だけを保存する。Redis 障害時や Lua の検証失敗時は認証を成功扱いにしない。新旧 Redis キーの二重書込み、読込み fallback、変換処理は行わない。
 
-切替時に `.tororomeshi.net` などの親ドメイン共有 Cookie、旧 `jwt` Cookie、旧 `session_id` Cookie、旧 JWT、`JWT_SECRET` による認証経路、`portal_backend` の旧 JWT 検証を無効化する。新構成が使用する Cookie は、認証基盤 host-only 共通セッション Cookie と、各 Web サービス host-only ローカルセッション Cookie だけである。いずれも正本設計に従い `HttpOnly`、`Secure`、`SameSite=Lax` とし、親ドメインを設定しない。
+切替時に `.tororomeshi.net` の親ドメイン共有 Cookie `jwt` と `session_id`（いずれも `Domain=.tororomeshi.net; Path=/`）、旧 JWT、`JWT_SECRET` による認証経路、`portal_backend` の旧 JWT 検証を無効化する。T21/T25/T26 の browser expiry artifact は必要だが、これだけを目的とする新しい恒久 runtime endpoint は追加しない。旧 Actix Cookie `id` は host-only `auth.tororomeshi.net; Path=/; Secure; HttpOnly; SameSite=Lax` であり、旧 Actix Redis session 削除、旧 runtime 停止、新 runtime が読まないことにより server-side invalidation を成立させる。新構成が使用する Cookie は、認証基盤 host-only 共通セッション Cookie と、各 Web サービス host-only ローカルセッション Cookie だけである。いずれも正本設計に従い `HttpOnly`、`Secure`、`SameSite=Lax` とし、親ドメインを設定しない。
 
 旧 Cookie の明示削除は、親ドメイン Cookie を発行した host と Domain 属性に対してのみ有効であるため、対象ブラウザに確実に届けられる通常の新版レスポンスで一回限りに失効できるかを切替前に確認する。必要な場合も、旧 Cookie 削除だけを目的とする互換エンドポイントは作らず、通常の新版ログイン開始、callback、logout またはエラー応答で失効を返す方式を検討する。旧 Cookie が残っていても、新構成が参照しないことで認証成功にならないことを不変条件とする。
 
@@ -77,7 +83,7 @@ Redis は現行の `rust-auth0-service` と `uniauth` がいずれも Redis URL 
 3. PostgreSQL の切替前バックアップを取得し、取得結果と復元対象を記録する。
 4. 停止状態の `users` を事前検査済みの手順で `internal_users` と `external_identities` へ一括変換する。件数、ID、外部 ID、一意制約、外部キーを検証し、identity sequence を調整して検証する。異常または不一致ならサービスを再開せず、ロールバック判断へ進む。
 5. 検証後、旧`users`テーブルを切替中に削除する。旧表を DB 内へ残さず、旧データを必要とする場合は切替前 PostgreSQL バックアップだけを用いる。
-6. 旧 Redis 認証状態を、共有状況に応じて旧認証キーだけ削除するか、認証専用領域を破棄する。旧状態の変換は行わない。
+6. shared Redis DB0 から安全に識別した旧認証 key だけを削除する。`FLUSHDB` / `FLUSHALL`、認証専用領域の一括破棄、旧状態の変換は行わない。分類不能 key が一件でもあれば削除せず cutover を停止する。
 7. 新しい全コンポーネントを一括配備し、旧コンポーネントを一括停止したままにする。新 API だけを公開し、旧 API、JWT 発行・検証、`JWT_SECRET`、親ドメイン Cookie 設定、任意 redirect、`ALLOWED_REDIRECT_ORIGINS` を残さない。
 8. `portal` と `portal_backend` の Web サービス Secret、PostgreSQL の SHA-256 検証値、完全一致 URI を静的に照合し、認証基盤側と Web サービス側の設定値が一致したことを確認する。設定が一つでも欠ければ有効化しない。
 9. サービス再開前の疎通確認として、メンテナンス状態を維持したまま `registered_web_services` を `is_enabled = true`へ変更する。第7章の最小疎通確認だけを実施し、Google ログイン試験には移行済みの既存Googleアカウントを使用する。そのアカウントが `external_identities` に既に存在することを事前確認する。ロールバック判断が完了するまで、未登録 Google アカウントによるログインを許可せず、疎通確認によって新しい `internal_users` または `external_identities` を作成しない。新規登録を一時的に制御する feature flag は設けず、メンテナンス中に検査用の既存アカウントだけを使う運用手順とする。
@@ -107,12 +113,12 @@ Google ログインを含む確認には移行済みの既存Googleアカウン�
 
 1. 新コンポーネントを停止する。
 2. PostgreSQL を切替前バックアップへ復元する。
-3. Redis の新認証状態を破棄する。
+3. shared Redis DB0 から安全に識別した新認証 state だけを削除する。`FLUSHDB` / `FLUSHALL` は使わず、分類不能 key が一件でもあれば rollback を停止する。
 4. ロールバック用の新しい`JWT_SECRET`を生成して Secret 管理領域へ配置する。
 5. 旧コンポーネントを、新しい `JWT_SECRET` で一括再配備する。
 6. 全利用者へ再ログインを要求する。
 
-旧構成へ戻す場合も、移行前の`JWT_SECRET`を再利用しない。ブラウザに移行前の旧 JWT が残っていても、新しい `JWT_SECRET` では検証に成功しないようにする。Redis セッションの削除だけで旧 JWT が失効するとは扱わない。新旧混在状態での部分ロールバック、新 DB の一部データから旧 DB への逆変換、旧セッションまたは旧 JWT の継続利用を禁止する。ロールバックは旧認証機能を復旧するものであり、移行前のログイン状態を復元するものではない。
+旧構成へ戻す場合も、移行前の`JWT_SECRET`を再利用しない。ブラウザに移行前の旧 JWT が残っていても、新しい `JWT_SECRET` では検証に成功しないようにする。Redis セッションの削除だけで旧 JWT が失効するとは扱わない。新旧混在状態での部分ロールバック、新 DB の一部データから旧 DB への逆変換、旧セッションまたは旧 JWT の継続利用を禁止する。consumer を新 auth へ移行する方針なら、その consumer 側も legacy auth へ戻せなければ rollback は成立しない。migration/retire 方針の決定前は auth0 namespace だけで rollback が十分とは決めず、cross-namespace rollback artifact scope は未確定とする。ロールバックは旧認証機能を復旧するものであり、移行前のログイン状態を復元するものではない。
 
 ロールバック判断は、新構成で新しいユーザーが作成される前に完了する。この順序により、バックアップ復元後の新規ユーザー差分を扱う必要を作らない。ロールバック後は旧構成へ一括復帰するため、再切替は新しい停止計画としてあらためて実施する。
 
@@ -121,14 +127,14 @@ Google ログインを含む確認には移行済みの既存Googleアカウン�
 移行完了は、次のすべてを満たす状態とする。
 
 - 新 API だけが存在し、旧 `/auth/google`、`/upsert_and_token`、`/sessions/verify`、旧 `/logout` は呼出不能である。
-- JWT 発行・検証コードと `JWT_SECRET` が不要であり、親ドメイン共有 Cookie を設定しない。
+- rust_auth0_service repo/auth0 scope で JWT 発行・検証コードと `JWT_SECRET` が不要であり、親ドメイン共有 Cookie を設定しない。system 全体の legacy JWT dependency の不存在は、全 downstream consumer resolution 完了後にだけ主張できる。
 - 旧 Redis 認証キーが存在せず、新 Redis は `auth:external:*`、`auth:session:*`、`auth:handoff:*`、`auth:logout:*` の新しい短期状態だけを扱う。
 - 旧`users`テーブルが存在しない。
 - 認証基盤が所有するアプリケーションテーブルは `internal_users`、`external_identities`、`registered_web_services` の3個だけである。
 - 全既存ユーザーの `internal_user_id` が元の `users.id` と一致し、全既存 Google ID が `external_identities` に一対一で対応する。
 - Web サービスが handoff 交換後に host-only ローカルセッションを作成し、共通認証 Cookie と Web サービス Cookie を共有しない。
 - すべての旧ログイン状態が無効であり、利用者は次回アクセス時に新構成での再ログインを要求される。
-- 移行前の `JWT_SECRET` が Secret 管理領域や Deployment 設定に残っておらず、ロールバック時も移行前 JWT を再び有効にしない。
+- rust_auth0_service repo/auth0 scope に移行前の `JWT_SECRET` が残っておらず、ロールバック時も移行前 JWT を再び有効にしない。
 - 疎通確認は移行済み既存ユーザーで完了しており、新規ユーザー作成を許可する前にロールバック判断が完了している。
 - portal と portal_backend が旧JWT Claimsのemail、name、pictureへ依存していない。
 - 互換コード、feature flag、二重書込み、読込み fallback、新旧並行稼働が残っていない。

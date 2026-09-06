@@ -51,7 +51,9 @@ portal_backend は `replicas: 1` と `Recreate` を前提にプロセスメモ�
 | `__Host-portal_login_ctx` | `Path=/`; `Secure`; `HttpOnly`; `SameSite=Lax`; Domainなし | LoginStartのブラウザ結合 |
 | `__Host-portal_csrf` | `Path=/`; `Secure`; HttpOnlyなし; `SameSite=Lax`; Domainなし | portalローカルログアウトCSRF平文 |
 
-旧Cookie情報は `jwt`、`session_id`、`Domain=.tororomeshi.net`、`Path=/` である。親ドメイン共有CookieおよびJWT Cookieは移行完了時に残さない。
+旧 Cookie の `jwt` と `session_id` は `Domain=.tororomeshi.net`、`Path=/` である。T21/T25/T26 は browser expiry artifact を持ち、新しい恒久 runtime endpoint を追加せずにこれらを失効する配信方式を成果物設計で確定する。親ドメイン共有CookieおよびJWT Cookieは移行完了時に残さない。
+
+旧 Actix Cookie `id` は host-only `auth.tororomeshi.net`、`Path=/`、`Secure`、`HttpOnly`、`SameSite=Lax` である。旧 Actix Redis session の削除、旧 runtime の停止、新 runtime が `id` を読まないことにより server-side invalidation を成立させる。物理削除のためだけの新 route/component は追加しない。
 
 ## 6. CSRF
 

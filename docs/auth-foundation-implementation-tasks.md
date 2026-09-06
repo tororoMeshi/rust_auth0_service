@@ -33,9 +33,11 @@ Gate A → T09 → T10 → T11 → T12 → Gate B
 Gate B → T13 → T14 → T15 → Gate C
 Gate C → T16 → T17
 Gate C → T18
-T15 + T17 + T18 → T19 → T20 → Gate D
-Gate D → T21 → T22 → T23 → T24 → T25 → Gate E → T26
+T15 + T17 + T18 → T19 → T20
+T20 → downstream legacy JWT consumer resolution → final Gate D → T21 → T22 → T23 → T24 → T25 → Gate E → T26
 ```
+
+`downstream legacy JWT consumer resolution` は新しいタスク番号ではない。各 consumer を新 Auth Foundation へ移行完了するか、T26 前に明示的に廃止するかを決定・完了するための先行条件である。既存 T21 を consumer runtime migration task へ拡張しない。
 
 ### Gate A: 保存層成立
 
@@ -63,11 +65,15 @@ Gate D → T21 → T22 → T23 → T24 → T25 → Gate E → T26
 
 ### Gate D: 新構成統合成立
 
+過去の Gate D review は、当時認識していた repo/auth0 scope の証拠に基づき PASS した。この履歴は変更しない。しかし T21 最終 blocker 調査で、legacy uniauth JWT を直接検証する downstream workload が4件判明したため、final Gate D の成立条件は再び未充足である。現在の canonical status は **REOPENED / BLOCKED** とする。最初から review が誤っていたとは扱わない。
+
+判明した consumer は `stateless-chat/nodejs-room`、`stateless-chat/websocket-chat-api`、`jamaica/play-matching`、`jamaica/matchmaking` である。いずれも `uniauth-secrets` の `jwt_secret` を `JWT_SECRET` として参照し、旧 uniauth JWT（`jwt` Cookie、HS256、shared `JWT_SECRET`、`sub` / `exp` claims）を直接検証する。新 Auth Foundation は legacy JWT を発行しないため、各 workload は T21 開始前に新 Auth Foundation へ移行完了、または T26 前に明示的に廃止されなければならない。既存 JWT の互換発行および generic JWT compatibility layer は採用しない。
+
 - portalの実経路 `Cloudflare Tunnel -> frontend-service -> frontend Nginx -> portal_backend` が所定のpathだけをbackendへ渡すことを確認する。dead Kubernetes Ingress ruleの存在だけを証拠にしない。
 - auth hostはrust-auth0-serviceへ直接到達し、T20後のactual source route集合がnew auth routesだけである。
 - SecretKeyRef契約、Deployment、NetworkPolicyがT19の固定値と境界を満たす。
 - `rust-auth0-service` は1 replica、`portal_backend` は1 replicaかつ `Recreate` である。
-- uniauth、JWT、旧API、親ドメインCookie、旧Redis JSONセッション、不要依存が残っていない。
+- rust_auth0_service repo/auth0 scope に uniauth、JWT、旧API、親ドメインCookie、旧Redis JSONセッション、不要依存が残っていない。system 全体の legacy JWT dependency が不存在であるという主張は、downstream consumer resolution 完了まで行わない。
 - PostgreSQLとRedisはIngressへ公開されていない。
 - 旧構成を削除したリポジトリ状態でも、T01で固定した不変image digest、Kubernetes構成、旧マニフェストの所在を参照できる。
 
@@ -665,7 +671,7 @@ T15、T17、T18が完了している。
 
 **目的**
 
-新経路の単体実装後に旧認証経路を残さず除去する。
+新経路の単体実装後に、rust_auth0_service repo 内の旧認証経路を残さず除去する。
 
 **前提**
 
@@ -691,6 +697,7 @@ T16–T19が完了している。
 - 新しい一括切替リリース内で旧経路が存在しない状態をリポジトリ上で作り、統合検証とリハーサルを行う。現在稼働中の旧本番環境はT26まで変更しない。
 - T18、T19、T20の成果物を個別に本番へ順次適用せず、本番への新マニフェスト適用、uniauth停止、旧API停止はT26の一括切替で同時に行う。
 - T01でロールバック元情報が固定されていなければ、旧コードや旧マニフェストを削除しない。T20でリポジトリから旧構成を削除しても、T01に記録した不変image digest、Kubernetes構成、旧マニフェストの所在、設定・Secret参照から旧構成を復元するための基準を維持する。
+- T20 の完了は rust_auth0_service repo 内の legacy uniauth/JWT/session/API/deployable artifacts の除去である。system 全体から legacy JWT dependency が消えたことを意味しない。downstream consumer の解決は final Gate D の先行条件として別に扱う。
 
 **検証**
 
@@ -708,7 +715,7 @@ T16–T19が完了している。
 
 **前提**
 
-Gate Dを通過し、T04で管理場所を確定している。
+T04で管理場所を確定し、downstream legacy JWT consumer resolution 後の **final Gate D** を通過している。現在は4件の consumer に forward-compatible auth path がないため、T21 implementation readiness は **BLOCKED** であり、開始可能とはしない。
 
 **主な変更対象**
 
@@ -722,6 +729,13 @@ Gate Dを通過し、T04で管理場所を確定している。
 - `registered_web_services`初期登録、service_secret生成、旧Redisキー安全識別・削除、PostgreSQLバックアップ・復元確認、旧Cookie失効、ロールバック用の新しいJWT_SECRET生成の成果物を作成する。portal-prodのservice_secretはSHA-256検証値を`registered_web_services`へ登録し、同じ平文を`auth0/portal-prod-service-secret`のkey `service_secret`としてcutover成果物へ配置する。具体的なscript/file名はT21実装時に既存管理方式へ合わせて決める。
 - T01で記録したイメージdigestを再確認し、T01で記録した不変image digest、Kubernetes構成、旧マニフェストの所在、設定・Secret参照をロールバック成果物として固定する。必要なイメージがレジストリからpull可能であることを確認する。
 - T01で記録した設定参照を使い、ロールバック用の新しいJWT_SECRETを組み込む手順と、旧構成を不変な成果物から再配備するチェックリストを作成する。可変タグだけをロールバック根拠にせず、T21で稼働中Podを唯一の情報源として初めてdigestを取得しない。
+- legacy user ID を再利用しない。`internal_users` identity sequence の次値は、writer 停止後に観測した `max(users.id) + 1` と legacy `users_id_seq` の実 next value の大きい方にする。現在の観測値は `max(users.id) = 36`、legacy sequence next = `125` であり、例示値は125である。ただし production script に125を hardcode しない。
+- cutover 成果物で runtime role `auth0_app_user` へ最小権限を付与する。`internal_users` は `SELECT` / `INSERT`、`external_identities` は `SELECT` / `INSERT`、`registered_web_services` は `SELECT`、`internal_users` identity sequence は `USAGE` とする。service registration / enable 等の運用 write 権限は付与しない。既存 schema migration `001` をこの時点で変更するとは決めない。
+- Redis DB0 は authentication 専用ではなく shared である。確認済み consumer は少なくとも `auth0/rust-auth0-service`、`auth0/uniauth`、`stateless-chat/nodejs-room`、`stateless-chat/websocket-chat-api` である。forward migration と rollback のいずれでも `FLUSHDB` / `FLUSHALL` を禁止し、安全に識別した key だけを削除する。分類不能 key が一件でもあれば削除せず cutover を停止し、script で推測、自動修復、自動削除をしない。
+- legacy Redis auth state の識別対象は、uniauth の prefix なし24文字 ASCII 英数字 key（string JSON、`user_id` / `expires_at`、TTL 約24h）と、old rust-auth0-service Actix session の prefix なし64文字 ASCII 英数字 key（string JSON map、`oauth_state` 必須、`redirect` 任意、TTL 約24h）である。`auth:external:`、`auth:session:`、`auth:handoff:`、`auth:logout:` は forward 削除対象外である。
+- `jwt` と `session_id` の parent-domain legacy Cookie は `Domain=.tororomeshi.net; Path=/` であり、T21/T25/T26 に browser expiry artifact を含める。旧 Actix Cookie `id`（host-only `auth.tororomeshi.net`; `Path=/`; `Secure`; `HttpOnly`; `SameSite=Lax`）は、旧 Actix Redis session 削除・旧 runtime 停止・新 runtime が読まないことにより server-side invalidation を成立させる。`id` を物理削除するだけの新 route/component は追加しない。
+- production Redis は6.2.6だが canonical storage design は Redis 7+ であり、不一致は unresolved blocker として扱う。T21 前に、7+ が必要な機能的不変条件を確認して upgrade するか、単なる選択 baseline なら minimum version requirement を再評価する。shared infrastructure の `redis:7.4.11-alpine` への upgrade を今回固定しない。
+- consumer を新 auth へ移行する方針なら、rollback 時には当該 consumer も legacy auth へ戻せなければならない。migration/retire 方針が未決定のため cross-namespace rollback artifact scope は未確定であり、現時点の確定 consumer は4 workloadだけである。同名 Secret の存在だけを理由に他 workload へ Secret を同期しない。
 - 一括切替チェックリストを作成し、SQL本文やShell本文を本タスクリストへ転記しない。
 
 **検証**
@@ -730,7 +744,7 @@ Gate Dを通過し、T04で管理場所を確定している。
 
 **完了条件**
 
-- 既存internal_user_id維持、全旧ログイン状態無効、全体ロールバックだけを明示できる。データ変換、sequence調整、旧users削除は通常migrationに含めず、通常起動、Pod再起動、アプリ更新によって再実行されない。
+- 既存internal_user_id維持、全旧ログイン状態無効、全体ロールバックだけを明示できる。上記の sequence high-water、runtime DB grants、shared Redis safety、Cookie expiry、Redis version decision、cross-namespace rollback scope を成果物として検証できる。データ変換、sequence調整、旧users削除は通常migrationに含めず、通常起動、Pod再起動、アプリ更新によって再実行されない。
 
 ### T22. 単体検証の整備
 

@@ -35,11 +35,13 @@ uniauthは `auth0-app-user.auth0-account-db.credentials.postgresql.acid.zalan.do
 
 ## 7. 復元に必要な成果物
 
-復元には上表のdigest、旧Deployment・Service・Ingress・ConfigMap・Secret参照・NetworkPolicy・ServiceAccount・probeの構成、build/deploy成果物の所在、PostgreSQL復元範囲、Redis破棄範囲を用いる。PostgreSQLの認証復元単位は `auth0_accounts` databaseであり、`auth0_app` を巻き戻さない。Redisは `rfrm-redisfailover:6379` のDB 0全体が認証用途の破棄範囲である。切替時のDB 0状態を確認してから実施する。
+復元には上表のdigest、旧Deployment・Service・Ingress・ConfigMap・Secret参照・NetworkPolicy・ServiceAccount・probeの構成、build/deploy成果物の所在、PostgreSQL復元範囲、Redis破棄範囲を用いる。PostgreSQLの認証復元単位は `auth0_accounts` databaseであり、`auth0_app` を巻き戻さない。active migration assumption では `rfrm-redisfailover:6379` の Redis DB0 は shared であり、DB0 全体を破棄範囲としない。forward migration / rollback とも `FLUSHDB` / `FLUSHALL` を使わず、安全に識別した key だけを削除する。分類不能 key が一件でもあれば削除せず cutover または rollback を停止する。
+
+legacy uniauth JWT consumer として、`stateless-chat/nodejs-room`、`stateless-chat/websocket-chat-api`、`jamaica/play-matching`、`jamaica/matchmaking` が確認されている。各 workload は `uniauth-secrets` の `jwt_secret` を `JWT_SECRET` として参照し、旧 JWT を直接検証する。consumer の migration/retire 方針が未決定のため、auth0 namespace だけで十分とは決めず、cross-namespace rollback artifact scope は未確定である。同名 Secret だけを理由に他 workload へ Secret を同期しない。
 
 ## 8. 取得できなかった情報
 
-Secret値、PostgreSQLのユーザー行、Redisの完全keyおよびvalueは取得していない。Redis DB 0は点検時点でkey総数0だったが、切替時にも空である保証ではない。正確な各imageの生成Gitコミット、特にportal_backendの生成コミットは未確定である。digest指定のpullと旧構成の実配備も未実証である。
+Secret値、PostgreSQLのユーザー行、Redisの完全keyおよびvalueは取得していない。Redis DB 0は historical observation として点検時点でkey総数0だったが、切替時にも空である保証ではない。この過去記録は DB0 の active shared ownership と混同しない。正確な各imageの生成Gitコミット、特にportal_backendの生成コミットは未確定である。digest指定のpullと旧構成の実配備も未実証である。
 
 ## 9. T01完了判定
 
