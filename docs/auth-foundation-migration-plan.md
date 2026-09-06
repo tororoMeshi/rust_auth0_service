@@ -29,7 +29,13 @@
 
 ## 3. 事前検査
 
-T21 を開始する前に、legacy uniauth JWT を直接検証する `stateless-chat/nodejs-room`、`stateless-chat/websocket-chat-api`、`jamaica/play-matching`、`jamaica/matchmaking` の各 workload について、新 Auth Foundation への移行完了または T26 前の明示的廃止のいずれかを完了する。新 Auth Foundation は legacy JWT を発行せず、既存 JWT の互換発行および generic JWT compatibility layer は採用しない。この consumer resolution は final Gate D の先行条件であり、未完了の間は T21 implementation readiness を BLOCKED とする。
+T21 を開始する前に、legacy uniauth JWT を直接検証する4 consumerの canonical decision を実装完了する。`stateless-chat/nodejs-room` は **MIGRATE**、`stateless-chat/websocket-chat-api`、`jamaica/play-matching`、`jamaica/matchmaking` は **RETIRE** であり、UNKNOWN は0件である。これは新番号付きtaskではなく、(A) nodejs-room auth migration、(B) unpublished stateless-chat branch retirement、(C) Jamaica legacy matching retirement の3論理作業である。依存は `T20 -> A/B/C -> final Gate D -> T21` とし、A/B/Cがすべて完了するまで Gate D は **REOPENED / BLOCKED**、T21 implementation readiness は **BLOCKED** とする。新 Auth Foundation は legacy JWT を発行せず、既存 JWT の互換発行、generic shared JWT、compatibility layer は採用しない。
+
+`nodejs-room` は `chat.tororomeshi.net -> Cloudflare Tunnel -> nodejs-room` の実公開chat経路であり、live static clientも `/socket.io/` を使用するためMIGRATEとする。chat appは自身のlocal sessionを、Auth Foundationはcommon SSO sessionを所有し、legacy parent-domain JWTを使わない。現状の2 replicasとprocess-memory room/message stateは移行前提として記録するが、1 replica化またはRedis local sessionの採用は実装前調査で最小構成を決めるまで固定しない。
+
+`websocket-chat-api` はDNSが存在してもCloudflare Tunnel hostname設定、有効IngressClass、Ingress status/addressがなく、外部到達経路を持たない。参照する`chat-frontend`も公開されておらず、直近720h request evidence、Redis DB0 state、nodejs-room置換完了の明示証拠もないためRETIREとする。Deploymentだけを削除せず、`chat-frontend`、`stateless-chat.tororomeshi.net`用Ingress、websocket-chat-apiのService/Deployment/config等を含む未公開系統のexact retirement scopeを実装前調査で決める。本書ではactual file一覧を推測しない。
+
+`play-matching` はcurrent caller、external route、persistent state、直近720h request evidenceがなく、current Jamaica frontend/proxyにも接続されていないためRETIREとする。`matchmaking` は `browser -> POST /api/matchmaking/get_matches -> jamaica-game -> http://matchmaking:8081/get_matches` に対し、実serviceが `matchmaking:8080 -> Pod:8080` でcurrent intended pathが成立せず、CPU player runtime、cluster-wide direct consumer、720h request evidence、persistent stateもないためRETIREとする。Deployment/Serviceだけを削除せず、`jamaica-game`のruntime proxy、frontend/template、config/env、manifest、source/build referenceを含むexact deletion scopeを実装前調査で確定し、壊れた`MATCHMAKING_SERVICE_URL`、`/api/matchmaking/*`、5秒polling等を意図的に残さない。本書では具体fileを推測しない。
 
 切替開始前に、PostgreSQL の切替前バックアップ取得方法と同じバックアップからの復元手順を、対象環境で確認する。復元安全性について、認証データが専用データベースまたは専用スキーマに分離されていること、または復元対象範囲へ書き込むすべてのコンポーネントを停止していることのいずれかを保証する。認証以外の処理が同じ復元対象へ書き込み続けている状態で PostgreSQL バックアップを復元しない。復元によって認証以外のデータを巻き戻す可能性がある場合は、一括切替を開始しない。部分的な新旧認証移行や二重書込みによってこの問題を回避しない。既存 `users` 件数を記録し、切替用 DDL、変換手順、Redis Lua の検証を完了する。実行可能な移行 SQL、Redis 削除スクリプト、Lua 本文は本書には記載しない。
 
@@ -118,7 +124,7 @@ Google ログインを含む確認には移行済みの既存Googleアカウン�
 5. 旧コンポーネントを、新しい `JWT_SECRET` で一括再配備する。
 6. 全利用者へ再ログインを要求する。
 
-旧構成へ戻す場合も、移行前の`JWT_SECRET`を再利用しない。ブラウザに移行前の旧 JWT が残っていても、新しい `JWT_SECRET` では検証に成功しないようにする。Redis セッションの削除だけで旧 JWT が失効するとは扱わない。新旧混在状態での部分ロールバック、新 DB の一部データから旧 DB への逆変換、旧セッションまたは旧 JWT の継続利用を禁止する。consumer を新 auth へ移行する方針なら、その consumer 側も legacy auth へ戻せなければ rollback は成立しない。migration/retire 方針の決定前は auth0 namespace だけで rollback が十分とは決めず、cross-namespace rollback artifact scope は未確定とする。ロールバックは旧認証機能を復旧するものであり、移行前のログイン状態を復元するものではない。
+旧構成へ戻す場合も、移行前の`JWT_SECRET`を再利用しない。ブラウザに移行前の旧 JWT が残っていても、新しい `JWT_SECRET` では検証に成功しないようにする。Redis セッションの削除だけで旧 JWT が失効するとは扱わない。新旧混在状態での部分ロールバック、新 DB の一部データから旧 DB への逆変換、旧セッションまたは旧 JWT の継続利用を禁止する。MIGRATEである`nodejs-room`のrollback scopeは移行実装とともに確定する。RETIRE consumerは通常のAuth Foundation rollbackで自動復活させず、retirement decision自体を戻す場合にだけpre-retirement manifest、image digest、source commitを参照して扱う。これはT21のauthentication rollbackへ混在させない。ロールバックは旧認証機能を復旧するものであり、移行前のログイン状態を復元するものではない。
 
 ロールバック判断は、新構成で新しいユーザーが作成される前に完了する。この順序により、バックアップ復元後の新規ユーザー差分を扱う必要を作らない。ロールバック後は旧構成へ一括復帰するため、再切替は新しい停止計画としてあらためて実施する。
 
@@ -128,6 +134,7 @@ Google ログインを含む確認には移行済みの既存Googleアカウン�
 
 - 新 API だけが存在し、旧 `/auth/google`、`/upsert_and_token`、`/sessions/verify`、旧 `/logout` は呼出不能である。
 - rust_auth0_service repo/auth0 scope で JWT 発行・検証コードと `JWT_SECRET` が不要であり、親ドメイン共有 Cookie を設定しない。system 全体の legacy JWT dependency の不存在は、全 downstream consumer resolution 完了後にだけ主張できる。
+- `nodejs-room` がnew Auth Foundation flowで認証可能であり、`websocket-chat-api`、`play-matching`、`matchmaking` がretiredである。runtime全体でlegacy `JWT_SECRET` consumer、legacy `jwt` Cookie verifier、HS256 legacy auth verifierが0件である。
 - 旧 Redis 認証キーが存在せず、新 Redis は `auth:external:*`、`auth:session:*`、`auth:handoff:*`、`auth:logout:*` の新しい短期状態だけを扱う。
 - 旧`users`テーブルが存在しない。
 - 認証基盤が所有するアプリケーションテーブルは `internal_users`、`external_identities`、`registered_web_services` の3個だけである。

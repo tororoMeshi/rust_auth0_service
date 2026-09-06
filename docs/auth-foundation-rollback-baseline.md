@@ -37,7 +37,7 @@ uniauthは `auth0-app-user.auth0-account-db.credentials.postgresql.acid.zalan.do
 
 復元には上表のdigest、旧Deployment・Service・Ingress・ConfigMap・Secret参照・NetworkPolicy・ServiceAccount・probeの構成、build/deploy成果物の所在、PostgreSQL復元範囲、Redis破棄範囲を用いる。PostgreSQLの認証復元単位は `auth0_accounts` databaseであり、`auth0_app` を巻き戻さない。active migration assumption では `rfrm-redisfailover:6379` の Redis DB0 は shared であり、DB0 全体を破棄範囲としない。forward migration / rollback とも `FLUSHDB` / `FLUSHALL` を使わず、安全に識別した key だけを削除する。分類不能 key が一件でもあれば削除せず cutover または rollback を停止する。
 
-legacy uniauth JWT consumer として、`stateless-chat/nodejs-room`、`stateless-chat/websocket-chat-api`、`jamaica/play-matching`、`jamaica/matchmaking` が確認されている。各 workload は `uniauth-secrets` の `jwt_secret` を `JWT_SECRET` として参照し、旧 JWT を直接検証する。consumer の migration/retire 方針が未決定のため、auth0 namespace だけで十分とは決めず、cross-namespace rollback artifact scope は未確定である。同名 Secret だけを理由に他 workload へ Secret を同期しない。
+legacy uniauth JWT consumer として、`stateless-chat/nodejs-room`、`stateless-chat/websocket-chat-api`、`jamaica/play-matching`、`jamaica/matchmaking` が確認されている。各 workload は `uniauth-secrets` の `jwt_secret` を `JWT_SECRET` として参照し、旧 JWT を直接検証する。canonical decision は `nodejs-room` = **MIGRATE**、`websocket-chat-api` = **RETIRE**、`play-matching` = **RETIRE**、`matchmaking` = **RETIRE** であり、UNKNOWN は0件である。`nodejs-room` migrationのrollback scopeは実装前調査で確定する。RETIRE consumerを通常のAuth Foundation rollbackで自動復活させず、retirement decision自体を戻す場合にだけpre-retirement manifest、image digest、source commitを参照する。これをT21のauthentication rollbackへ混在させず、同名 Secretだけを理由に他workloadへSecretを同期しない。
 
 ## 8. 取得できなかった情報
 
