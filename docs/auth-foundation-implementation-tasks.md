@@ -37,7 +37,7 @@ T15 + T17 + T18 → T19 → T20
 T20 → downstream legacy JWT consumer resolution → final Gate D → T21 → T22 → T23 → T24 → T25 → Gate E → T26
 ```
 
-`downstream legacy JWT consumer resolution` は新しいタスク番号ではない。これは次の3論理作業をすべて完了する先行条件であり、既存 T20/T21 に consumer runtime migration task を押し込まない。(A) `nodejs-room` の新 Auth Foundation への認証移行、(B) 未公開 stateless-chat 系統（`websocket-chat-api` と関連する `chat-frontend`／routing artifact）の retirement、(C) Jamaica legacy matching 系統（`play-matching`、`matchmaking`、および dead caller／proxy／UI reference）の retirement。retirement 実装前調査で exact deletion scope を確定し、今回の文書では具体的な file 一覧を推測しない。
+`downstream legacy JWT consumer resolution` は新しいタスク番号ではない。これは次の3論理作業をすべて完了する先行条件であり、既存 T20/T21 に consumer runtime migration task を押し込まない。(A) `nodejs-room` の新 Auth Foundation への認証移行、(B) 未公開 stateless-chat 系統（`websocket-chat-api` と関連する `chat-frontend`／routing artifact）の retirement、(C) Jamaica legacy matching 系統（`play-matching`、`matchmaking`、および dead caller／proxy／UI reference）の retirement。Aの完了は新方式のsource implementation、deployment/config/cutover artifact、tests/review、rollback artifact/inputの完成である。Bの完了はdeployable source/manifest上のretirement、T26で削除するlive resource一覧の確定、nodejs-roomを壊さない検証であり、Cも同様にrepo/deployable artifact上のretirement、T26 live removal一覧、残すJamaica component検証である。A/B/Cのproduction適用またはlive deletionは完了条件に含めず、T26だけで行う。retirement 実装前調査で exact deletion scope を確定し、今回の文書では具体的な file 一覧を推測しない。
 
 ### Gate A: 保存層成立
 
@@ -78,7 +78,7 @@ T20 → downstream legacy JWT consumer resolution → final Gate D → T21 → T
 - SecretKeyRef契約、Deployment、NetworkPolicyがT19の固定値と境界を満たす。
 - `rust-auth0-service` は1 replica、`portal_backend` は1 replicaかつ `Recreate` である。
 - rust_auth0_service repo/auth0 scope に uniauth、JWT、旧API、親ドメインCookie、旧Redis JSONセッション、不要依存が残っていない。system 全体の legacy JWT dependency が不存在であるという主張は、downstream consumer resolution 完了まで行わない。
-- A/B/Cがすべて完了し、`nodejs-room` がnew Auth Foundation flowで認証可能である。`websocket-chat-api`、`play-matching`、`matchmaking` はretiredであり、runtime全体で legacy `JWT_SECRET` consumer、legacy `jwt` Cookie verifier、HS256 legacy auth verifier が0件である。
+- A/B/Cがすべてcutover readinessとして完了し、承認済みのpost-cutover deployment/source setで`nodejs-room` がnew Auth Foundation flowで認証可能である。同setでは`websocket-chat-api`、`play-matching`、`matchmaking` はretiredであり、legacy `JWT_SECRET` consumer、legacy `jwt` Cookie verifier、HS256 legacy auth verifier が0件である。current productionに旧consumerが残ることはT26前の既知baselineとして許容し、final Gate Dはproduction cutover済みを要求しない。
 - PostgreSQLとRedisはIngressへ公開されていない。
 - 旧構成を削除したリポジトリ状態でも、T01で固定した不変image digest、Kubernetes構成、旧マニフェストの所在を参照できる。
 
@@ -720,7 +720,7 @@ T16–T19が完了している。
 
 **前提**
 
-T04で管理場所を確定し、downstream legacy JWT consumer resolution A/B/C 後の **final Gate D** を通過している。A/B/Cがすべて未完了である間、T21 implementation readiness は **BLOCKED** であり、開始可能とはしない。Redis version decision はconsumer resolutionとは別のblockerとして維持する。
+T04で管理場所を確定し、implementation/cutover readinessとして完了したdownstream legacy JWT consumer resolution A/B/C 後の **final Gate D** を通過している。A/B/Cがすべて未完了である間、T21 implementation readiness は **BLOCKED** であり、開始可能とはしない。A/B/Cをproductionへ適用することはT21開始の前提ではなく、T21は完成済みconsumer artifactを入力としてDB migration、RegisteredWebService、Secret、Redis invalidation、backup/restore、rollbackを確定する。Redis version decision はconsumer resolutionとは別のblockerとして維持する。
 
 **主な変更対象**
 
@@ -890,6 +890,7 @@ Gate Eを通過している。
 
 - T21の一括切替チェックリストを順に実行し、バックアップ、migration、初期登録、配備、旧状態無効化、公開後確認を行う。
 - T18〜T20の承認済み成果物を一括適用し、Cloudflare TunnelからServiceへの既存edge構成のまま新経路を公開する。T26でCloudflare routingを再設計しない。
+- T26は唯一のproduction一括切替境界である。新 Auth Foundation、portal、nodejs-room migrated artifact、B/C retirementのlive deletion、DB/Secret/Redis migration、routingの承認済み成果物をここで一括適用し、部分互換・二重運用は行わない。
 - 問題時はT21で定義した全体ロールバックだけを行い、部分互換や二重運用を開始しない。
 - T26実施中に新しいコード、SQL、Lua、YAMLをその場で修正しない。問題が見つかった場合は作業を止め、承認済みの全体ロールバックを行う。
 

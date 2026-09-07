@@ -29,7 +29,7 @@
 
 ## 3. 事前検査
 
-T21 を開始する前に、legacy uniauth JWT を直接検証する4 consumerの canonical decision を実装完了する。`stateless-chat/nodejs-room` は **MIGRATE**、`stateless-chat/websocket-chat-api`、`jamaica/play-matching`、`jamaica/matchmaking` は **RETIRE** であり、UNKNOWN は0件である。これは新番号付きtaskではなく、(A) nodejs-room auth migration、(B) unpublished stateless-chat branch retirement、(C) Jamaica legacy matching retirement の3論理作業である。依存は `T20 -> A/B/C -> final Gate D -> T21` とし、A/B/Cがすべて完了するまで Gate D は **REOPENED / BLOCKED**、T21 implementation readiness は **BLOCKED** とする。新 Auth Foundation は legacy JWT を発行せず、既存 JWT の互換発行、generic shared JWT、compatibility layer は採用しない。
+T21 を開始する前に、legacy uniauth JWT を直接検証する4 consumerの canonical decision をimplementation/cutover readinessとして完了する。`stateless-chat/nodejs-room` は **MIGRATE**、`stateless-chat/websocket-chat-api`、`jamaica/play-matching`、`jamaica/matchmaking` は **RETIRE** であり、UNKNOWN は0件である。これは新番号付きtaskではなく、(A) nodejs-room auth migration、(B) unpublished stateless-chat branch retirement、(C) Jamaica legacy matching retirement の3論理作業である。Aは新方式のsource implementation、deployment/config/cutover artifact、tests/review、rollback artifact/inputの完成を必要とする。Bはdeployable source/manifest上のretirement、T26で削除するlive resource一覧、nodejs-roomを壊さない検証を、Cはrepo/deployable artifact上のretirement、T26 live removal一覧、残すJamaica component検証を必要とする。依存は `T20 -> A/B/C -> final Gate D -> T21` とし、A/B/Cがすべて完了するまで Gate D は **REOPENED / BLOCKED**、T21 implementation readiness は **BLOCKED** とする。A/B/Cのproduction適用またはlive deletionはT21開始の前提ではなく、T21は完成済みconsumer artifactを入力としてDB migration、RegisteredWebService、Secret、Redis invalidation、backup/restore、rollbackを確定する。新 Auth Foundation は legacy JWT を発行せず、既存 JWT の互換発行、generic shared JWT、compatibility layer は採用しない。
 
 `nodejs-room` は `chat.tororomeshi.net -> Cloudflare Tunnel -> nodejs-room` の実公開chat経路であり、live static clientも `/socket.io/` を使用するためMIGRATEとする。chat appは自身のlocal sessionを、Auth Foundationはcommon SSO sessionを所有し、legacy parent-domain JWTを使わない。現状の2 replicasとprocess-memory room/message stateは移行前提として記録するが、1 replica化またはRedis local sessionの採用は実装前調査で最小構成を決めるまで固定しない。
 
@@ -90,7 +90,7 @@ production Redis は6.2.6だが canonical storage design は Redis 7+ である�
 4. 停止状態の `users` を事前検査済みの手順で `internal_users` と `external_identities` へ一括変換する。件数、ID、外部 ID、一意制約、外部キーを検証し、identity sequence を調整して検証する。異常または不一致ならサービスを再開せず、ロールバック判断へ進む。
 5. 検証後、旧`users`テーブルを切替中に削除する。旧表を DB 内へ残さず、旧データを必要とする場合は切替前 PostgreSQL バックアップだけを用いる。
 6. shared Redis DB0 から安全に識別した旧認証 key だけを削除する。`FLUSHDB` / `FLUSHALL`、認証専用領域の一括破棄、旧状態の変換は行わない。分類不能 key が一件でもあれば削除せず cutover を停止する。
-7. 新しい全コンポーネントを一括配備し、旧コンポーネントを一括停止したままにする。新 API だけを公開し、旧 API、JWT 発行・検証、`JWT_SECRET`、親ドメイン Cookie 設定、任意 redirect、`ALLOWED_REDIRECT_ORIGINS` を残さない。
+7. 新しい全コンポーネントを一括配備し、旧コンポーネントを一括停止したままにする。これは唯一のproduction一括切替境界であり、新 Auth Foundation、portal、nodejs-room migrated artifact、B/C retirementのlive deletion、DB/Secret/Redis migration、routingの承認済み成果物をここで適用する。新 API だけを公開し、旧 API、JWT 発行・検証、`JWT_SECRET`、親ドメイン Cookie 設定、任意 redirect、`ALLOWED_REDIRECT_ORIGINS` を残さない。
 8. `portal` と `portal_backend` の Web サービス Secret、PostgreSQL の SHA-256 検証値、完全一致 URI を静的に照合し、認証基盤側と Web サービス側の設定値が一致したことを確認する。設定が一つでも欠ければ有効化しない。
 9. サービス再開前の疎通確認として、メンテナンス状態を維持したまま `registered_web_services` を `is_enabled = true`へ変更する。第7章の最小疎通確認だけを実施し、Google ログイン試験には移行済みの既存Googleアカウントを使用する。そのアカウントが `external_identities` に既に存在することを事前確認する。ロールバック判断が完了するまで、未登録 Google アカウントによるログインを許可せず、疎通確認によって新しい `internal_users` または `external_identities` を作成しない。新規登録を一時的に制御する feature flag は設けず、メンテナンス中に検査用の既存アカウントだけを使う運用手順とする。
 10. 疎通確認成功とロールバック不要の判断後、Web サービスのメンテナンスを解除してサービスを再開する。全利用者には新構成での再ログインを要求する。
@@ -134,7 +134,7 @@ Google ログインを含む確認には移行済みの既存Googleアカウン�
 
 - 新 API だけが存在し、旧 `/auth/google`、`/upsert_and_token`、`/sessions/verify`、旧 `/logout` は呼出不能である。
 - rust_auth0_service repo/auth0 scope で JWT 発行・検証コードと `JWT_SECRET` が不要であり、親ドメイン共有 Cookie を設定しない。system 全体の legacy JWT dependency の不存在は、全 downstream consumer resolution 完了後にだけ主張できる。
-- `nodejs-room` がnew Auth Foundation flowで認証可能であり、`websocket-chat-api`、`play-matching`、`matchmaking` がretiredである。runtime全体でlegacy `JWT_SECRET` consumer、legacy `jwt` Cookie verifier、HS256 legacy auth verifierが0件である。
+- approved post-cutover deployment/source setで`nodejs-room` がnew Auth Foundation flowで認証可能であり、`websocket-chat-api`、`play-matching`、`matchmaking` がretiredである。同setでlegacy `JWT_SECRET` consumer、legacy `jwt` Cookie verifier、HS256 legacy auth verifierが0件である。current productionに旧consumerが残ることはT26前の既知baselineとして許容し、これはfinal Gate Dでproduction cutover済みを要求する条件ではない。
 - 旧 Redis 認証キーが存在せず、新 Redis は `auth:external:*`、`auth:session:*`、`auth:handoff:*`、`auth:logout:*` の新しい短期状態だけを扱う。
 - 旧`users`テーブルが存在しない。
 - 認証基盤が所有するアプリケーションテーブルは `internal_users`、`external_identities`、`registered_web_services` の3個だけである。
