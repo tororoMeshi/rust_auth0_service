@@ -34,10 +34,10 @@ Gate B → T13 → T14 → T15 → Gate C
 Gate C → T16 → T17
 Gate C → T18
 T15 + T17 + T18 → T19 → T20
-T20 → downstream legacy JWT consumer resolution → final Gate D → T21 → T22 → T23 → T24 → T25 → Gate E → T26
+T20 → Gate D → T21 → T22 → T23 → T24 → T25 → Gate E → T26
 ```
 
-`downstream legacy JWT consumer resolution` は新しいタスク番号ではない。これは次の3論理作業をすべて完了する先行条件であり、既存 T20/T21 に consumer runtime migration task を押し込まない。(A) `nodejs-room` の新 Auth Foundation への認証移行、(B) 未公開 stateless-chat 系統（`websocket-chat-api` と関連する `chat-frontend`／routing artifact）の retirement、(C) Jamaica legacy matching 系統（`play-matching`、`matchmaking`、および dead caller／proxy／UI reference）の retirement。Aの完了は新方式のsource implementation、deployment/config/cutover artifact、tests/review、rollback artifact/inputの完成である。Bの完了はdeployable source/manifest上のretirement、T26で削除するlive resource一覧の確定、nodejs-roomを壊さない検証であり、Cも同様にrepo/deployable artifact上のretirement、T26 live removal一覧、残すJamaica component検証である。A/B/Cのproduction適用またはlive deletionは完了条件に含めず、T26だけで行う。retirement 実装前調査で exact deletion scope を確定し、今回の文書では具体的な file 一覧を推測しない。
+downstream legacy JWT consumer は後続調査で判明した external release prerequisite であり、本リポジトリの implementation task ではない。新task番号を作らず、Track A/B/C はそれぞれ external prerequisite A（`nodejs-room` の **MIGRATE**）、B（`websocket-chat-api` の **RETIRE**）、C（`play-matching` と `matchmaking` の **RETIRE**）として扱う。external service implementation はこのリポジトリの task ownership の外である。
 
 ### Gate A: 保存層成立
 
@@ -65,20 +65,20 @@ T20 → downstream legacy JWT consumer resolution → final Gate D → T21 → T
 
 ### Gate D: 新構成統合成立
 
-過去の review は、当時認識していた repo/auth0 scope の証拠に基づく完了記録である。この履歴は変更しない。しかし T21 最終 blocker 調査で、legacy uniauth JWT を直接検証する downstream workload が4件判明したため、final Gate D の成立条件は再び未充足である。現在の canonical status は **REOPENED / BLOCKED** とする。最初から review が誤っていたとは扱わない。
+過去の review は、当時認識していた repo/auth0 scope の証拠に基づく完了記録であり、現在の canonical status は **PASS** である。T21 最終 blocker 調査で legacy uniauth JWT を直接検証する downstream workload が4件判明した事実と decision は維持するが、これは Gate D の再判定理由ではなく、T26 の external release prerequisite とする。最初から review が誤っていたとは扱わない。
 
 判明した consumer は `stateless-chat/nodejs-room`、`stateless-chat/websocket-chat-api`、`jamaica/play-matching`、`jamaica/matchmaking` である。いずれも `uniauth-secrets` の `jwt_secret` を `JWT_SECRET` として参照し、旧 uniauth JWT（`jwt` Cookie、HS256、shared `JWT_SECRET`、`sub` / `exp` claims）を直接検証する。canonical decision は `nodejs-room` = **MIGRATE**、`websocket-chat-api` = **RETIRE**、`play-matching` = **RETIRE**、`matchmaking` = **RETIRE** であり、UNKNOWN は0件である。既存 JWT の互換発行、generic shared JWT、compatibility layer は採用しない。
 
-`nodejs-room` は `chat.tororomeshi.net -> Cloudflare Tunnel -> nodejs-room` の実公開 chat 経路であり、live static client も `/socket.io/` を使用するため、停止すると公開 chat 機能が欠落する。chat app は自身の local session を所有し、Auth Foundation は common SSO session を所有する。legacy parent-domain JWT は使用しない。現状は2 replicasでroom/message stateがprocess memoryにあることを移行前提として記録するが、1 replica化またはRedis local sessionの採用はまだ固定せず、実装前調査で最小構成を決める。
+`nodejs-room` の local session design、source implementation、image、Deployment、および rollback は external owner が所有する。rust_auth0_service は Auth Foundation contract、RegisteredWebService/cutover inputs、および external readiness confirmation を提供・確認する。
 
-`websocket-chat-api` はDNSが存在してもCloudflare Tunnel hostname設定、有効IngressClass、Ingress status/addressがなく外部到達経路を持たず、`chat-frontend` も公開されていない。直近720h request evidence、Redis DB0 state、nodejs-room置換完了の明示証拠もないため、現在要求されるsystem outcomeのために維持する必要性は証明されていない。`play-matching` はcurrent caller、external route、persistent stateおよび直近720h request evidenceがなく、current Jamaica frontend/proxyにも接続されていない。`matchmaking` はproduction runtimeの `browser -> POST /api/matchmaking/get_matches -> jamaica-game -> http://matchmaking:8081/get_matches` に対して、実serviceが `matchmaking:8080 -> Pod:8080` でありcurrent intended pathが成立しない。CPU player runtime、cluster-wide direct consumer、720h request evidence、persistent stateもない。技術的に利用可能であることや将来公開できることは、これらRETIRE consumerの維持理由にしない。
+`websocket-chat-api`、`play-matching`、`matchmaking` の RETIRE 実装、外部リソース削除、および rollback は external owner が所有する。rust_auth0_service は RETIRE decision と coordinated cutover completion confirmation だけを保持する。
 
 - portalの実経路 `Cloudflare Tunnel -> frontend-service -> frontend Nginx -> portal_backend` が所定のpathだけをbackendへ渡すことを確認する。dead Kubernetes Ingress ruleの存在だけを証拠にしない。
 - auth hostはrust-auth0-serviceへ直接到達し、T20後のactual source route集合がnew auth routesだけである。
 - SecretKeyRef契約、Deployment、NetworkPolicyがT19の固定値と境界を満たす。
 - `rust-auth0-service` は1 replica、`portal_backend` は1 replicaかつ `Recreate` である。
 - rust_auth0_service repo/auth0 scope に uniauth、JWT、旧API、親ドメインCookie、旧Redis JSONセッション、不要依存が残っていない。system 全体の legacy JWT dependency が不存在であるという主張は、downstream consumer resolution 完了まで行わない。
-- A/B/Cがすべてcutover readinessとして完了し、承認済みのpost-cutover deployment/source setで`nodejs-room` がnew Auth Foundation flowで認証可能である。同setでは`websocket-chat-api`、`play-matching`、`matchmaking` はretiredであり、legacy `JWT_SECRET` consumer、legacy `jwt` Cookie verifier、HS256 legacy auth verifier が0件である。current productionに旧consumerが残ることはT26前の既知baselineとして許容し、final Gate Dはproduction cutover済みを要求しない。
+- Gate E/T26 の external readiness condition は、`nodejs-room` の migration artifact と rollback input、ならびに `websocket-chat-api`、`play-matching`、`matchmaking` の coordinated cutover 向け retirement ready/completed confirmation を各 external owner が提供することである。これらは Gate D または T21–T25 の implementation blocker ではない。
 - PostgreSQLとRedisはIngressへ公開されていない。
 - 旧構成を削除したリポジトリ状態でも、T01で固定した不変image digest、Kubernetes構成、旧マニフェストの所在を参照できる。
 
@@ -702,7 +702,7 @@ T16–T19が完了している。
 - 新しい一括切替リリース内で旧経路が存在しない状態をリポジトリ上で作り、統合検証とリハーサルを行う。現在稼働中の旧本番環境はT26まで変更しない。
 - T18、T19、T20の成果物を個別に本番へ順次適用せず、本番への新マニフェスト適用、uniauth停止、旧API停止はT26の一括切替で同時に行う。
 - T01でロールバック元情報が固定されていなければ、旧コードや旧マニフェストを削除しない。T20でリポジトリから旧構成を削除しても、T01に記録した不変image digest、Kubernetes構成、旧マニフェストの所在、設定・Secret参照から旧構成を復元するための基準を維持する。
-- T20 の完了は rust_auth0_service repo 内の legacy uniauth/JWT/session/API/deployable artifacts の除去である。system 全体から legacy JWT dependency が消えたことを意味しない。downstream consumer の解決は final Gate D の先行条件として別に扱う。
+- T20 の完了は rust_auth0_service repo 内の legacy uniauth/JWT/session/API/deployable artifacts の除去である。system 全体から legacy JWT dependency が消えたことを意味しない。known external consumer の migrated/retired 確認は、T26 で旧認証を停止する前の coordinated release condition として扱う。
 
 **検証**
 
@@ -720,7 +720,7 @@ T16–T19が完了している。
 
 **前提**
 
-T04で管理場所を確定し、implementation/cutover readinessとして完了したdownstream legacy JWT consumer resolution A/B/C 後の **final Gate D** を通過している。A/B/Cがすべて未完了である間、T21 implementation readiness は **BLOCKED** であり、開始可能とはしない。A/B/Cをproductionへ適用することはT21開始の前提ではなく、T21は完成済みconsumer artifactを入力としてDB migration、RegisteredWebService、Secret、Redis invalidation、backup/restore、rollbackを確定する。Redis version decision はconsumer resolutionとは別のblockerとして維持する。
+T04で管理場所を確定し、**PASS** の Gate D を通過している。T21 は external consumer を理由には BLOCK しない。T21 は **BLOCKED** であり、理由は **Redis version requirement decision pending** のみである。Redis 7+ requirement の扱いは本タスクでは決定しない。
 
 **主な変更対象**
 
@@ -740,7 +740,7 @@ T04で管理場所を確定し、implementation/cutover readinessとして完了
 - legacy Redis auth state の識別対象は、uniauth の prefix なし24文字 ASCII 英数字 key（string JSON、`user_id` / `expires_at`、TTL 約24h）と、old rust-auth0-service Actix session の prefix なし64文字 ASCII 英数字 key（string JSON map、`oauth_state` 必須、`redirect` 任意、TTL 約24h）である。`auth:external:`、`auth:session:`、`auth:handoff:`、`auth:logout:` は forward 削除対象外である。
 - `jwt` と `session_id` の parent-domain legacy Cookie は `Domain=.tororomeshi.net; Path=/` であり、T21/T25/T26 に browser expiry artifact を含める。旧 Actix Cookie `id`（host-only `auth.tororomeshi.net`; `Path=/`; `Secure`; `HttpOnly`; `SameSite=Lax`）は、旧 Actix Redis session 削除・旧 runtime 停止・新 runtime が読まないことにより server-side invalidation を成立させる。`id` を物理削除するだけの新 route/component は追加しない。
 - production Redis は6.2.6だが canonical storage design は Redis 7+ であり、不一致は unresolved blocker として扱う。T21 前に、7+ が必要な機能的不変条件を確認して upgrade するか、単なる選択 baseline なら minimum version requirement を再評価する。shared infrastructure の `redis:7.4.11-alpine` への upgrade を今回固定しない。
-- `nodejs-room` migration のrollback要件は実装前調査で確定する。一方、RETIRE consumerを通常のAuth Foundation rollbackで自動復活させない。retirement decision自体を戻すために、各RETIRE consumerのpre-retirement manifest、image digest、source commitを参照可能にする。これはT21のauthentication rollbackへ混在させない。同名 Secret の存在だけを理由に他 workload へ Secret を同期しない。
+- external consumer の rollback は external owner の責務である。RETIRE consumerを通常のAuth Foundation rollbackで自動復活させず、同名 Secret の存在だけを理由に他 workloadへ Secret を同期しない。
 - 一括切替チェックリストを作成し、SQL本文やShell本文を本タスクリストへ転記しない。
 
 **検証**
@@ -890,7 +890,8 @@ Gate Eを通過している。
 
 - T21の一括切替チェックリストを順に実行し、バックアップ、migration、初期登録、配備、旧状態無効化、公開後確認を行う。
 - T18〜T20の承認済み成果物を一括適用し、Cloudflare TunnelからServiceへの既存edge構成のまま新経路を公開する。T26でCloudflare routingを再設計しない。
-- T26は唯一のproduction一括切替境界である。新 Auth Foundation、portal、nodejs-room migrated artifact、B/C retirementのlive deletion、DB/Secret/Redis migration、routingの承認済み成果物をここで一括適用し、部分互換・二重運用は行わない。
+- T26は唯一のproduction一括切替境界である。rust_auth0_service は Auth Foundation、portal deployment/config、auth DB migration、RegisteredWebService、own Secret、auth Redis migration/invalidation、own routing、legacy auth shutdown、および own rollback を一括適用する。external owner は同一 cutover window で自らの migration/retirement と rollback を実行する。T26 は external workload を直接 mutation しない。
+- 旧 JWT 停止前の coordinated release condition は、全 known external legacy JWT consumer が migrated または retired と external owner により確認済みであることとする。確認が得られなければ T26 は **NO-GO** とし、legacy auth shutdown を開始しない。
 - 問題時はT21で定義した全体ロールバックだけを行い、部分互換や二重運用を開始しない。
 - T26実施中に新しいコード、SQL、Lua、YAMLをその場で修正しない。問題が見つかった場合は作業を止め、承認済みの全体ロールバックを行う。
 
