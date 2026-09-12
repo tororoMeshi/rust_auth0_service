@@ -2,7 +2,7 @@
 
 ## 1. 設計方針
 
-PostgreSQLを永続データの正本、Redisを期限付きの認証処理状態だけの正本とする。初期実装は単一の書き込み先を持つRedisを使用する。Redis Clusterによる複数シャードへの分散は初期対象外とする。Redis 7.0以降を使用する。レプリカやフェイルオーバーの具体方式は別工程で決める。初期構成のPostgreSQLテーブルは`internal_users`、`external_identities`、`registered_web_services`の3個だけである。`internal_user_id`は現在の`users.id`と同じ`integer`を唯一のユーザー識別子として継続利用し、公開用IDや別のサロゲートIDは持たない。
+PostgreSQLを永続データの正本、Redisを期限付きの認証処理状態だけの正本とする。初期実装は単一の書き込み先を持つRedisを使用する。Redis Clusterによる複数シャードへの分散は初期対象外とする。本番の基準Redisは6.2.6とする。レプリカやフェイルオーバーの具体方式は別工程で決める。初期構成のPostgreSQLテーブルは`internal_users`、`external_identities`、`registered_web_services`の3個だけである。`internal_user_id`は現在の`users.id`と同じ`integer`を唯一のユーザー識別子として継続利用し、公開用IDや別のサロゲートIDは持たない。
 
 外部プロバイダーとの対応は`external_identities`の`(provider, subject)`で一意に決める。メール、プロフィール、外部トークン、外部レスポンスは保存しない。Webサービスの許可済みcallback先、logout戻り先、単一のSecret検証値は`registered_web_services`の1行へ直接保存する。
 
@@ -139,7 +139,7 @@ Redis Hash内の`created_at`、`authenticated_at`、`issued_at`、`expires_at`�
 
 ## 5. TTL
 
-TTLは初期値として、外部認証トランザクションを600秒、共通認証セッションを28,800秒、AuthenticationHandoffを120秒、共通ログアウト一時状態を600秒とする。すべてのHashに論理的な`expires_at`を保存し、同じ絶対期限をRedis TTLとして設定する。通常書込みでは同じ`expires_at`を`EXPIREAT`へ渡す。読み取りおよびLua操作は`expires_at`も確認するため、RedisのTTLだけには依存しない。
+TTLは初期値として、外部認証トランザクションを600秒、共通認証セッションを28,800秒、AuthenticationHandoffを120秒、共通ログアウト一時状態を600秒とする。すべてのHashに論理的な`expires_at`を保存する。通常書込みでは同じ絶対期限を`EXPIREAT`へ渡し、Redis keyの物理期限はcleanupと早期消滅時のfail-closed defense-in-depthとして扱う。論理的な認可期限のauthorityは、保存した`expires_at`とRedis server `TIME`であり、Redis TTLは第二の認可期限authorityではない。
 
 共通認証セッションは絶対有効期限であり、アクセスやSSO handoff発行ではTTLを延長しない。handoff使用済みHashのTTLも発行時の有効期限から変えない。
 
@@ -155,7 +155,7 @@ Redisの原子操作はLuaで行い、WATCH/MULTIの再試行ループ、分散�
 
 Luaは、入力、キー存在、期限、状態、対応関係をすべて検証してから書き込みを始める。書き込み開始後に入力不備によるエラーが起きない構造にする。sessionまたはhandoffを新規作成する場合、作成先キーが存在しないことを確認する。作成先キーが既に存在する場合は上書きせず失敗する。Luaが使用するすべてのRedisキーは、スクリプト内で組み立てず、明示的なキー引数として渡す。
 
-外部callbackのclaim、SSO handoff発行、初回認証のsessionとhandoff作成、handoff交換、共通ログアウトの各Lua操作は、実行開始時に`redis.call("TIME")`を一度だけ行い、返された秒部分をそのLua実行内の`now`として使用する。アプリケーションから現在時刻をLuaへ渡さず、一つのLua実行中は一度取得した`now`を使う。期限内は`expires_at >= now`ではなく`now < expires_at`の場合だけとし、`now == expires_at`は期限切れとする。Redis TTLとHash内の`expires_at`の両方を確認し、Redisの読込または`TIME`取得に失敗した場合は成功にしない。
+外部callbackのclaim、SSO handoff発行、初回認証のsessionとhandoff作成、handoff交換、共通ログアウトの各Lua操作は、実行開始時に`redis.call("TIME")`を一度だけ行い、返された秒部分をそのLua実行内の`now`として使用する。アプリケーションから現在時刻をLuaへ渡さず、一つのLua実行中は一度取得した`now`を使う。期限内は`expires_at >= now`ではなく`now < expires_at`の場合だけとし、`now == expires_at`は期限切れとする。論理期限はHash内の`expires_at`を`TIME`で確認する。物理期限はcleanupのために設定し、キーが早期に消滅した場合は不在としてfail closedする。Redisの読込または`TIME`取得に失敗した場合は成功にしない。
 
 外部callbackのclaimは、外部transactionのlookupを入力とする。キーの存在、`now < expires_at`、`status = waiting`を確認し、`status`を`processing`に変更してcallback検証に必要な全フィールドを返す。同時callbackでは1件だけが成功する。
 

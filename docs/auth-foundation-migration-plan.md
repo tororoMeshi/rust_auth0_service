@@ -29,7 +29,7 @@
 
 ## 3. 事前検査
 
-legacy uniauth JWT を直接検証する4 consumer の canonical decision は、external release prerequisite として維持する。`stateless-chat/nodejs-room` は **MIGRATE**、`stateless-chat/websocket-chat-api`、`jamaica/play-matching`、`jamaica/matchmaking` は **RETIRE** であり、UNKNOWN は0件である。Track A/B/C はそれぞれ external prerequisite A/B/C であり、rust_auth0_service の implementation workstream ではない。依存は `T20 -> Gate D -> T21 -> T22 -> T23 -> T24 -> T25 -> Gate E -> T26` とする。T21 の blocker は Redis version requirement decision pending のみである。external owner は source migration/retirement、image、Deployment / Service / Ingress、rollback を所有し、rust_auth0_service は Auth Foundation contract と cutover inputs を提供して external readiness を確認する。新 Auth Foundation は legacy JWT を発行せず、既存 JWT の互換発行、generic shared JWT、compatibility layer は採用しない。
+legacy uniauth JWT を直接検証する4 consumer の canonical decision は、external release prerequisite として維持する。`stateless-chat/nodejs-room` は **MIGRATE**、`stateless-chat/websocket-chat-api`、`jamaica/play-matching`、`jamaica/matchmaking` は **RETIRE** であり、UNKNOWN は0件である。Track A/B/C はそれぞれ external prerequisite A/B/C であり、rust_auth0_service の implementation workstream ではない。依存は `T20 -> Gate D -> T21 -> T22 -> T23 -> T24 -> T25 -> Gate E -> T26` とする。Redis version blockerは解消済みで、T21 は **READY** である。external owner は source migration/retirement、image、Deployment / Service / Ingress、rollback を所有し、rust_auth0_service は Auth Foundation contract と cutover inputs を提供して external readiness を確認する。新 Auth Foundation は legacy JWT を発行せず、既存 JWT の互換発行、generic shared JWT、compatibility layer は採用しない。
 
 `nodejs-room` は **MIGRATE** とする。local session design、source implementation、image、Deployment、および rollback は external owner が所有する。
 
@@ -47,7 +47,7 @@ legacy uniauth JWT を直接検証する4 consumer の canonical decision は、
 
 Redis DB0 は authentication 専用ではなく shared である。確認済み consumer は少なくとも `auth0/rust-auth0-service`、`auth0/uniauth`、`stateless-chat/nodejs-room`、`stateless-chat/websocket-chat-api` である。forward migration と rollback の双方で `FLUSHDB` と `FLUSHALL` を使わず、安全に識別した旧 auth key だけを削除する。uniauth は prefix なし24文字 ASCII 英数字 key（string JSON、`user_id` / `expires_at`、TTL 約24h）、old rust-auth0-service Actix session は prefix なし64文字 ASCII 英数字 key（string JSON map、`oauth_state` 必須、`redirect` 任意、TTL 約24h）として識別する。新しい `auth:external:`、`auth:session:`、`auth:handoff:`、`auth:logout:` は forward 削除対象外である。分類不能 key が一件でもあれば削除せず cutover を停止し、推測・自動修復・自動削除をしない。
 
-production Redis は6.2.6だが canonical storage design は Redis 7+ である。T21 の blocker は、7+ が必要な機能的不変条件を確認して upgrade すること、または単なる選択 baseline なら minimum version requirement を再評価することのいずれかである。shared infrastructure の `redis:7.4.11-alpine` への upgrade は今回固定しない。
+production Redis 6.2.6を使用する。保存した`expires_at`とRedis server `TIME`が論理的な認可期限authorityであり、`EXPIREAT`によるkeyの物理期限はcleanupと早期消滅時のfail-closed defense-in-depthである。shared RedisまたはSpotahome Redis OperatorのupgradeはAuth Foundation migration requirementではない。
 
 次の全項目が満たされない限り一括切替を開始しない。
 

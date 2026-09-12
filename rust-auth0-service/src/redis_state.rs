@@ -65,7 +65,6 @@ if service_id == false or service_state == false or challenge == false or provid
 local now = tonumber(redis.call("TIME")[1])
 local expiry = tonumber(expires_at)
 if now >= expiry then redis.call("DEL", KEYS[1]); return {2} end
-if redis.call("EXPIRETIME", KEYS[1]) ~= expiry then return invalid() end
 if status == "processing" then return {4} end
 if status ~= "waiting" then return invalid() end
 redis.call("HSET", KEYS[1], "status", "processing")
@@ -97,7 +96,6 @@ local session_expires = redis.call("HGET", KEYS[1], "expires_at")
 if not int(session_user) or not uint(session_authenticated) or not uint(session_created) or not uint(session_expires) then return invalid() end
 local now = tonumber(redis.call("TIME")[1])
 if now >= tonumber(session_expires) then redis.call("DEL", KEYS[1]); return {2} end
-if redis.call("EXPIRETIME", KEYS[1]) ~= tonumber(session_expires) then return invalid() end
 if redis.call("EXISTS", KEYS[2]) ~= 0 then return {9} end
 if not lookup(ARGV[1]) or KEYS[1] ~= "auth:session:" .. ARGV[1] then return invalid() end
 if ARGV[9] ~= "unused" or not int(ARGV[3]) or not lookup(ARGV[4]) or not uint(ARGV[6])
@@ -175,7 +173,6 @@ if handoff_service == false or not int(handoff_user) or not lookup(handoff_looku
   or not uint(handoff_authenticated) or not uint(handoff_issued) or not uint(handoff_expires) or handoff_status == false then return invalid() end
 local now = tonumber(redis.call("TIME")[1])
 if now >= tonumber(handoff_expires) then redis.call("DEL", KEYS[1]); return {2} end
-if redis.call("EXPIRETIME", KEYS[1]) ~= tonumber(handoff_expires) then return invalid() end
 if handoff_status == "used" then return {5} end
 if handoff_status ~= "unused" then return invalid() end
 if handoff_service ~= ARGV[1] then return {6} end
@@ -190,7 +187,6 @@ local session_created = redis.call("HGET", KEYS[2], "created_at")
 local session_expires = redis.call("HGET", KEYS[2], "expires_at")
 if not int(session_user) or not uint(session_authenticated) or not uint(session_created) or not uint(session_expires) then return invalid() end
 if now >= tonumber(session_expires) then redis.call("DEL", KEYS[2]); return {2} end
-if redis.call("EXPIRETIME", KEYS[2]) ~= tonumber(session_expires) then return invalid() end
 if tonumber(handoff_user) ~= tonumber(session_user) or tonumber(handoff_authenticated) ~= tonumber(session_authenticated) then return invalid() end
 redis.call("HSET", KEYS[1], "status", "used")
 return {0, tonumber(handoff_user), tonumber(handoff_authenticated)}
@@ -227,7 +223,6 @@ if service_id == false or return_uri == false or not lookup(csrf_lookup) or not 
   or not uint(expires_at) or status == false then return invalid() end
 local now = tonumber(redis.call("TIME")[1])
 if now >= tonumber(expires_at) then redis.call("DEL", KEYS[1]); return {2} end
-if redis.call("EXPIRETIME", KEYS[1]) ~= tonumber(expires_at) then return invalid() end
 if status == "used" then return {5} end
 if status ~= "unused" then return invalid() end
 if not lookup(ARGV[1]) then return {8} end
@@ -996,14 +991,6 @@ mod tests {
             .unwrap()
     }
 
-    async fn redis_expiretime(connection: &mut MultiplexedConnection, key: &str) -> i64 {
-        redis::cmd("EXPIRETIME")
-            .arg(key)
-            .query_async(connection)
-            .await
-            .unwrap()
-    }
-
     async fn set_hash_field(
         connection: &mut MultiplexedConnection,
         key: &str,
@@ -1147,7 +1134,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    #[ignore = "requires AUTH_FOUNDATION_TEST_REDIS_URL and a disposable Redis 7 instance"]
+    #[ignore = "requires AUTH_FOUNDATION_TEST_REDIS_URL and a disposable Redis 6.2.6 instance"]
     async fn redis_hash_state_integration() {
         let redis_url = std::env::var("AUTH_FOUNDATION_TEST_REDIS_URL")
             .expect("AUTH_FOUNDATION_TEST_REDIS_URL must be set for this ignored test");
@@ -1222,18 +1209,6 @@ mod tests {
                 .collect();
             expected_fields.sort();
             assert_eq!(actual_fields, expected_fields);
-            let expires_at: u64 = redis::cmd("HGET")
-                .arg(key)
-                .arg("expires_at")
-                .query_async(&mut connection)
-                .await
-                .unwrap();
-            let expiretime: i64 = redis::cmd("EXPIRETIME")
-                .arg(key)
-                .query_async(&mut connection)
-                .await
-                .unwrap();
-            assert_eq!(expiretime, expires_at as i64);
         }
 
         assert_eq!(
@@ -1321,7 +1296,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    #[ignore = "requires AUTH_FOUNDATION_TEST_REDIS_URL and a disposable Redis 7 instance"]
+    #[ignore = "requires AUTH_FOUNDATION_TEST_REDIS_URL and a disposable Redis 6.2.6 instance"]
     async fn t08_redis_lua_atomic_operations() {
         let redis_url = std::env::var("AUTH_FOUNDATION_TEST_REDIS_URL")
             .expect("AUTH_FOUNDATION_TEST_REDIS_URL must be set for this ignored test");
@@ -1363,6 +1338,11 @@ mod tests {
         let mut callback = external();
         callback.expires_at = now + 120;
         write_external(&mut connection, external_reference, &callback, now)
+            .await
+            .unwrap();
+        redis::cmd("PERSIST")
+            .arg(external_key(external_reference))
+            .query_async::<()>(&mut connection)
             .await
             .unwrap();
         let claimed = claim_external_callback(&mut connection, external_reference)
@@ -1421,17 +1401,11 @@ mod tests {
         )
         .await
         .unwrap();
-        for (key, expires_at) in [
-            (session_key(session_reference), session_state.expires_at),
-            (handoff_key(handoff_reference), initial_handoff.expires_at),
-        ] {
-            let expiretime: i64 = redis::cmd("EXPIRETIME")
-                .arg(key)
-                .query_async(&mut connection)
-                .await
-                .unwrap();
-            assert_eq!(expiretime, expires_at as i64);
-        }
+        redis::cmd("PERSIST")
+            .arg(session_key(session_reference))
+            .query_async::<()>(&mut connection)
+            .await
+            .unwrap();
         assert_eq!(
             create_session_and_handoff(
                 &mut connection,
@@ -1449,11 +1423,6 @@ mod tests {
             .await
             .unwrap());
 
-        let session_expiretime_before: i64 = redis::cmd("EXPIRETIME")
-            .arg(session_key(session_reference))
-            .query_async(&mut connection)
-            .await
-            .unwrap();
         let mut issued_handoff = handoff(UsageStatus::Unused);
         issued_handoff.common_session_lookup = reference_value_lookup(session_reference);
         issued_handoff.expires_at = now + 110;
@@ -1466,14 +1435,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            redis::cmd("EXPIRETIME")
-                .arg(session_key(session_reference))
-                .query_async::<i64>(&mut connection)
-                .await
-                .unwrap(),
-            session_expiretime_before
-        );
-        assert_eq!(
             issue_sso_handoff(
                 &mut connection,
                 session_reference,
@@ -1483,11 +1444,6 @@ mod tests {
             .await,
             Err(RedisStateError::KeyConflict)
         );
-        let handoff_expiretime_before: i64 = redis::cmd("EXPIRETIME")
-            .arg(handoff_key(issued_handoff_reference))
-            .query_async(&mut connection)
-            .await
-            .unwrap();
         assert_eq!(
             exchange_handoff(
                 &mut connection,
@@ -1500,14 +1456,6 @@ mod tests {
                 internal_user_id: 42,
                 authenticated_at: 101,
             })
-        );
-        assert_eq!(
-            redis::cmd("EXPIRETIME")
-                .arg(handoff_key(issued_handoff_reference))
-                .query_async::<i64>(&mut connection)
-                .await
-                .unwrap(),
-            handoff_expiretime_before
         );
         assert_eq!(
             exchange_handoff(
@@ -1580,9 +1528,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let logout_expiretime_before: i64 = redis::cmd("EXPIRETIME")
+        redis::cmd("PERSIST")
             .arg(logout_key(logout_reference))
-            .query_async(&mut connection)
+            .query_async::<()>(&mut connection)
             .await
             .unwrap();
         assert_eq!(
@@ -1594,14 +1542,6 @@ mod tests {
             )
             .await,
             Ok(logout_state.logout_return_uri.clone())
-        );
-        assert_eq!(
-            redis::cmd("EXPIRETIME")
-                .arg(logout_key(logout_reference))
-                .query_async::<i64>(&mut connection)
-                .await
-                .unwrap(),
-            logout_expiretime_before
         );
         assert!(redis::cmd("EXISTS")
             .arg(logout_key(logout_reference))
@@ -1687,6 +1627,11 @@ mod tests {
         write_external(&mut connection, expired_reference, &future_ttl, now)
             .await
             .unwrap();
+        redis::cmd("PERSIST")
+            .arg(&expired_key)
+            .query_async::<()>(&mut connection)
+            .await
+            .unwrap();
         redis::cmd("HSET")
             .arg(&expired_key)
             .arg("expires_at")
@@ -1704,6 +1649,24 @@ mod tests {
             .await
             .unwrap());
 
+        let early_expiry_reference = "t08-early-physical-expiry";
+        let early_expiry_key = external_key(early_expiry_reference);
+        let mut early_expiry = external();
+        early_expiry.expires_at = now + 60;
+        write_external(&mut connection, early_expiry_reference, &early_expiry, now)
+            .await
+            .unwrap();
+        redis::cmd("EXPIREAT")
+            .arg(&early_expiry_key)
+            .arg(1)
+            .query_async::<()>(&mut connection)
+            .await
+            .unwrap();
+        assert_eq!(
+            claim_external_callback(&mut connection, early_expiry_reference).await,
+            Err(RedisStateError::NotFound)
+        );
+
         for key in keys.iter().chain([concurrent_key, expired_key].iter()) {
             redis::cmd("DEL")
                 .arg(key)
@@ -1714,7 +1677,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    #[ignore = "requires AUTH_FOUNDATION_TEST_REDIS_URL and a disposable Redis 7 instance"]
+    #[ignore = "requires AUTH_FOUNDATION_TEST_REDIS_URL and a disposable Redis 6.2.6 instance"]
     async fn t08_redis_lua_rejects_invalid_states_without_mutation() {
         let redis_url = std::env::var("AUTH_FOUNDATION_TEST_REDIS_URL")
             .expect("AUTH_FOUNDATION_TEST_REDIS_URL must be set for this ignored test");
@@ -1974,7 +1937,6 @@ mod tests {
         .await
         .unwrap();
         let exchange_key = handoff_key(&exchange_handoff_reference);
-        let exchange_session_key = session_key(&exchange_session);
         assert_eq!(
             exchange_handoff(
                 &mut connection,
@@ -2094,38 +2056,31 @@ mod tests {
                 .await
                 .unwrap();
             let key = handoff_key(reference);
-            let handoff_ttl = redis_expiretime(&mut connection, &key).await;
-            let session_ttl = redis_expiretime(&mut connection, &exchange_session_key).await;
             set_hash_field(&mut connection, &key, field, value).await;
             assert_eq!(
                 exchange_handoff(&mut connection, reference, "service", "challenge").await,
                 Err(RedisStateError::InvalidStoredState)
             );
             assert_eq!(redis_status(&mut connection, &key).await, "unused");
-            assert_eq!(redis_expiretime(&mut connection, &key).await, handoff_ttl);
-            assert_eq!(
-                redis_expiretime(&mut connection, &exchange_session_key).await,
-                session_ttl
-            );
         }
 
         write_handoff(&mut connection, &ttl_handoff, &exchange_handoff_state, now)
             .await
             .unwrap();
         let ttl_handoff_key = handoff_key(&ttl_handoff);
-        redis::cmd("EXPIREAT")
+        redis::cmd("PERSIST")
             .arg(&ttl_handoff_key)
-            .arg(now + 30)
             .query_async::<()>(&mut connection)
             .await
             .unwrap();
-        assert_eq!(
-            exchange_handoff(&mut connection, &ttl_handoff, "service", "challenge").await,
-            Err(RedisStateError::InvalidStoredState)
+        assert!(
+            exchange_handoff(&mut connection, &ttl_handoff, "service", "challenge")
+                .await
+                .is_ok()
         );
         assert_eq!(
             redis_status(&mut connection, &ttl_handoff_key).await,
-            "unused"
+            "used"
         );
 
         let mut logout_state = logout();
@@ -2163,6 +2118,11 @@ mod tests {
             .await
             .unwrap();
         let logout_expired_key = logout_key(&logout_expired);
+        redis::cmd("PERSIST")
+            .arg(&logout_expired_key)
+            .query_async::<()>(&mut connection)
+            .await
+            .unwrap();
         set_hash_field(
             &mut connection,
             &logout_expired_key,
@@ -2219,7 +2179,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    #[ignore = "requires AUTH_FOUNDATION_TEST_REDIS_URL and a disposable Redis 7 instance"]
+    #[ignore = "requires AUTH_FOUNDATION_TEST_REDIS_URL and a disposable Redis 6.2.6 instance"]
     async fn t12_common_logout_csrf_full_length_regression() {
         let redis_url = std::env::var("AUTH_FOUNDATION_TEST_REDIS_URL")
             .expect("AUTH_FOUNDATION_TEST_REDIS_URL must be set");

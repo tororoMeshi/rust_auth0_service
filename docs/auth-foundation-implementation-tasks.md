@@ -720,7 +720,7 @@ T16–T19が完了している。
 
 **前提**
 
-T04で管理場所を確定し、**PASS** の Gate D を通過している。T21 は external consumer を理由には BLOCK しない。T21 は **BLOCKED** であり、理由は **Redis version requirement decision pending** のみである。Redis 7+ requirement の扱いは本タスクでは決定しない。
+T04で管理場所を確定し、**PASS** の Gate D を通過している。T21 は external consumer を理由には BLOCK しない。Redis version blockerは解消済みであり、T21 は **READY** である。本番の基準Redis 6.2.6で、保存した`expires_at`とRedis `TIME`を論理期限authorityとする。
 
 **主な変更対象**
 
@@ -739,7 +739,7 @@ T04で管理場所を確定し、**PASS** の Gate D を通過している。T21
 - Redis DB0 は authentication 専用ではなく shared である。確認済み consumer は少なくとも `auth0/rust-auth0-service`、`auth0/uniauth`、`stateless-chat/nodejs-room`、`stateless-chat/websocket-chat-api` である。forward migration と rollback のいずれでも `FLUSHDB` / `FLUSHALL` を禁止し、安全に識別した key だけを削除する。分類不能 key が一件でもあれば削除せず cutover を停止し、script で推測、自動修復、自動削除をしない。
 - legacy Redis auth state の識別対象は、uniauth の prefix なし24文字 ASCII 英数字 key（string JSON、`user_id` / `expires_at`、TTL 約24h）と、old rust-auth0-service Actix session の prefix なし64文字 ASCII 英数字 key（string JSON map、`oauth_state` 必須、`redirect` 任意、TTL 約24h）である。`auth:external:`、`auth:session:`、`auth:handoff:`、`auth:logout:` は forward 削除対象外である。
 - `jwt` と `session_id` の parent-domain legacy Cookie は `Domain=.tororomeshi.net; Path=/` であり、T21/T25/T26 に browser expiry artifact を含める。旧 Actix Cookie `id`（host-only `auth.tororomeshi.net`; `Path=/`; `Secure`; `HttpOnly`; `SameSite=Lax`）は、旧 Actix Redis session 削除・旧 runtime 停止・新 runtime が読まないことにより server-side invalidation を成立させる。`id` を物理削除するだけの新 route/component は追加しない。
-- production Redis は6.2.6だが canonical storage design は Redis 7+ であり、不一致は unresolved blocker として扱う。T21 前に、7+ が必要な機能的不変条件を確認して upgrade するか、単なる選択 baseline なら minimum version requirement を再評価する。shared infrastructure の `redis:7.4.11-alpine` への upgrade を今回固定しない。
+- production Redis 6.2.6を使用する。論理期限は保存した`expires_at`とRedis `TIME`で判定し、`EXPIREAT`による物理期限はcleanupと早期消滅時のfail-closed defense-in-depthとして扱う。shared Redisまたはoperatorのupgrade、manifest image pin追加はT21の要件ではない。
 - external consumer の rollback は external owner の責務である。RETIRE consumerを通常のAuth Foundation rollbackで自動復活させず、同名 Secret の存在だけを理由に他 workloadへ Secret を同期しない。
 - 一括切替チェックリストを作成し、SQL本文やShell本文を本タスクリストへ転記しない。
 

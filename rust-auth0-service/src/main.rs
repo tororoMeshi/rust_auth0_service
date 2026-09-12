@@ -926,7 +926,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    #[ignore = "requires disposable PostgreSQL and Redis 7"]
+    #[ignore = "requires disposable PostgreSQL and Redis 6.2.6"]
     async fn t10_login_http_integration_cases() {
         use crate::redis_state::{read_handoff, write_session, CommonSession};
         use sqlx::postgres::PgPoolOptions;
@@ -1393,7 +1393,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    #[ignore = "requires disposable PostgreSQL and Redis 7"]
+    #[ignore = "requires disposable PostgreSQL and Redis 6.2.6"]
     async fn t11_google_callback_http_integration_cases() {
         use crate::redis_state::{read_external, read_handoff, read_session};
         use sqlx::postgres::PgPoolOptions;
@@ -2033,7 +2033,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    #[ignore = "requires disposable PostgreSQL and Redis 7"]
+    #[ignore = "requires disposable PostgreSQL and Redis 6.2.6"]
     async fn t12_handoff_exchange_and_common_logout_http_integration() {
         use crate::auth_foundation::sha256_digest;
         use crate::redis_state::{
