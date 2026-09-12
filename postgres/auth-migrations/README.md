@@ -49,8 +49,8 @@ T05 以降は、ローカルで起動済みの破棄可能な空 PostgreSQL に�
 
 ## cutover との分離
 
-T21 の一括切替 SQL は将来 `postgres/auth-migrations/cutover/` に置きます。このディレクトリは通常 migration 適用スクリプトの対象外です。T21 までは、users 変換、sequence 調整、旧 users 削除、`registered_web_services` 初期登録、cutover SQL、バックアップ・復元手順、ロールバック SQL を作成しません。空ディレクトリを維持するための `.gitkeep` も追加しません。
+T21 の一括切替成果物は `postgres/auth-migrations/cutover/` に置きます。このディレクトリは通常 migration 適用スクリプトの対象外です。one-shot SQL、Secret preparation、Cookie expiry、Redis identified-key invalidation、backup/restore と own rollback の正本は [cutover/README.md](cutover/README.md) です。通常 migration、通常起動、Pod再起動では実行しません。
 
 ## postgres-init-sql.yaml との関係
 
-`postgres/postgres-init-sql.yaml` は旧 `users` を含む既存初期化資産です。通常 migration の入力ではなく、`apply-auth-migrations.sh` から実行しません。PostgreSQL Operator の自動 migration 機構でもありません。現在は `postgres-init-job.yaml` から明示的に実行されます。更新または廃止の判断は T21 まで先送りします。
+`postgres/postgres-init-sql.yaml` は旧 `users` を含む既存初期化資産です。通常 migration の入力ではなく、`apply-auth-migrations.sh` から実行しません。PostgreSQL Operator の自動 migration 機構でもありません。T21後も新schema初期化へ流用せず、legacy rollback baselineの入力としてだけ保持します。

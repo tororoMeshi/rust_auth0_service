@@ -1,0 +1,5 @@
+# Temporary T21 response artifact, not a permanent runtime endpoint.
+# Serve once through the approved HTTPS cutover/maintenance path, then remove it.
+HTTP/1.1 204 No Content
+Set-Cookie: jwt=; Domain=.tororomeshi.net; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Secure; HttpOnly; SameSite=Strict
+Set-Cookie: session_id=; Domain=.tororomeshi.net; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Secure; HttpOnly; SameSite=Strict
