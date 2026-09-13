@@ -1337,6 +1337,58 @@ mod tests {
             .await
             .expect("remove invalid session");
 
+        // J. STRING に置換した session key は実Redis WRONGTYPE を RedisFailure として
+        // 503 にし、Google fallback や認証成功artifactを作らない。
+        let redis_failure_reference = generate_reference_value().expect("Redis failure reference");
+        let redis_failure_key = crate::redis_state::session_key(&redis_failure_reference);
+        let _: () = redis::cmd("SET")
+            .arg(&redis_failure_key)
+            .arg("wrong-type")
+            .query_async(&mut connection)
+            .await
+            .expect("write wrong-type session");
+        assert_eq!(
+            crate::redis_state::read_session(
+                &mut connection,
+                &redis_failure_reference,
+                unix_seconds(SystemTime::now()).expect("clock"),
+            )
+            .await,
+            Err(RedisStateError::RedisFailure)
+        );
+        let external_before_redis_failure =
+            state_key_count(&mut connection, "auth:external:*").await;
+        let handoff_before_redis_failure = state_key_count(&mut connection, "auth:handoff:*").await;
+        let redis_failure = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&login_uri(&service_id, "redis-failure", &challenge, "S256"))
+                .cookie(Cookie::new(
+                    AUTH_SESSION_COOKIE_NAME,
+                    redis_failure_reference.clone(),
+                ))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(
+            redis_failure.status(),
+            actix_web::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(redis_failure.headers().get(header::LOCATION).is_none());
+        assert_eq!(
+            state_key_count(&mut connection, "auth:external:*").await,
+            external_before_redis_failure
+        );
+        assert_eq!(
+            state_key_count(&mut connection, "auth:handoff:*").await,
+            handoff_before_redis_failure
+        );
+        let _: i32 = redis::cmd("DEL")
+            .arg(&redis_failure_key)
+            .query_async(&mut connection)
+            .await
+            .expect("remove wrong-type session");
+
         // H. 閉じた専用 Pool は 503 で、serviceなしへ偽装されない。
         let closed_pool = PgPoolOptions::new()
             .max_connections(1)
@@ -1401,7 +1453,7 @@ mod tests {
         use std::net::TcpListener;
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
-            Arc,
+            Arc, Mutex,
         };
 
         #[derive(Clone)]
@@ -1409,6 +1461,7 @@ mod tests {
             token_calls: Arc<AtomicUsize>,
             userinfo_calls: Arc<AtomicUsize>,
             mode: Arc<AtomicUsize>,
+            pool_to_close: Arc<Mutex<Option<PgPool>>>,
         }
 
         async fn token(google: web::Data<FakeGoogle>) -> HttpResponse {
@@ -1426,10 +1479,33 @@ mod tests {
 
         async fn userinfo(google: web::Data<FakeGoogle>) -> HttpResponse {
             google.userinfo_calls.fetch_add(1, Ordering::SeqCst);
-            match google.mode.load(Ordering::SeqCst) {
+            let mode = google.mode.load(Ordering::SeqCst);
+            if mode == 5 {
+                let pool = google
+                    .pool_to_close
+                    .lock()
+                    .expect("lock failure pool")
+                    .take();
+                if let Some(pool) = pool {
+                    pool.close().await;
+                }
+            }
+            match mode {
                 2 => HttpResponse::BadGateway().finish(),
                 3 => HttpResponse::Ok().json(serde_json::json!({"id": ""})),
-                4 => HttpResponse::Ok().json(serde_json::json!({"id": "google-subject-disabled"})),
+                4..=7 => HttpResponse::Ok().json(serde_json::json!({
+                    "id": match mode {
+                        4 => "google-subject-disabled",
+                        5 => "google-subject-db-failure",
+                        6 => "google-subject-same-profile-a",
+                        7 => "google-subject-same-profile-b",
+                        _ => unreachable!(),
+                    },
+                    "email": "same@example.test",
+                    "verified_email": true,
+                    "name": "Same Name",
+                    "picture": "https://example.test/picture.png"
+                })),
                 _ => HttpResponse::Ok().json(serde_json::json!({
                     "id": "google-subject-new",
                     "email": "user@example.test",
@@ -1520,6 +1596,7 @@ mod tests {
             token_calls: Arc::new(AtomicUsize::new(0)),
             userinfo_calls: Arc::new(AtomicUsize::new(0)),
             mode: Arc::new(AtomicUsize::new(0)),
+            pool_to_close: Arc::new(Mutex::new(None)),
         };
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake Google");
         let address = listener.local_addr().expect("fake Google address");
@@ -1543,7 +1620,7 @@ mod tests {
                 Some(ClientSecret::new("test-secret".to_owned())),
                 AuthUrl::new("https://accounts.example.test/authorize".to_owned())
                     .expect("authorization URL"),
-                Some(TokenUrl::new(token_url).expect("token URL")),
+                Some(TokenUrl::new(token_url.clone()).expect("token URL")),
             )
             .set_redirect_uri(
                 RedirectUrl::new("https://auth.example.test/auth/google/callback".to_owned())
@@ -1754,6 +1831,82 @@ mod tests {
                 .unwrap(),
             users_before_existing
         );
+
+        // 同一email/nameでも provider + subject が異なれば別本人であり、既存本人へ
+        // merge しない。Google payloadのprofile metadataは両callbackで同一である。
+        let same_profile_users_before: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM public.internal_users")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let same_profile_a_reference = generate_reference_value().unwrap();
+        let same_profile_b_reference = generate_reference_value().unwrap();
+        let mut same_profile_user_ids = Vec::new();
+        for (mode, reference, state) in [
+            (6, &same_profile_a_reference, "same-profile-a"),
+            (7, &same_profile_b_reference, "same-profile-b"),
+        ] {
+            fake_google.mode.store(mode, Ordering::SeqCst);
+            insert_external(&mut connection, reference, &service_id, state).await;
+            let same_profile = actix_web::test::call_service(
+                &app,
+                actix_web::test::TestRequest::get()
+                    .uri(&callback_uri("same-profile", reference))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(same_profile.status(), actix_web::http::StatusCode::FOUND);
+            let location = reqwest::Url::parse(
+                same_profile
+                    .headers()
+                    .get(header::LOCATION)
+                    .expect("same-profile redirect")
+                    .to_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            let handoff_reference = location
+                .query_pairs()
+                .find_map(|(key, value)| (key == "code").then(|| value.into_owned()))
+                .expect("same-profile handoff");
+            same_profile_user_ids.push(
+                read_handoff(
+                    &mut connection,
+                    &handoff_reference,
+                    unix_seconds(SystemTime::now()).unwrap(),
+                )
+                .await
+                .unwrap()
+                .internal_user_id,
+            );
+        }
+        assert_ne!(same_profile_user_ids[0], same_profile_user_ids[1]);
+        assert_eq!(
+            sqlx::query_scalar::<_, i32>(
+                "SELECT internal_user_id FROM public.external_identities WHERE provider = 'google' AND subject = 'google-subject-same-profile-a'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            same_profile_user_ids[0]
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i32>(
+                "SELECT internal_user_id FROM public.external_identities WHERE provider = 'google' AND subject = 'google-subject-same-profile-b'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            same_profile_user_ids[1]
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM public.internal_users")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            same_profile_users_before + 2
+        );
+        fake_google.mode.store(0, Ordering::SeqCst);
 
         // query validation は claim/Google 呼出前に止まる。
         let input_reference = generate_reference_value().unwrap();
@@ -1997,6 +2150,115 @@ mod tests {
             userinfo_before_disabled
         );
 
+        // Google token/profile成功後、resolve_external_identity の時点で閉じたPoolに
+        // すると503で停止し、本人未発見として新規作成・handoff発行へ進まない。
+        let resolve_failure_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .expect("connect resolve failure pool");
+        let resolve_failure_app = actix_web::test::init_service(
+            App::new()
+                .app_data(web::Data::new(resolve_failure_pool.clone()))
+                .app_data(web::Data::new(redis_connection.clone()))
+                .app_data(web::Data::new(GoogleCallbackConfig {
+                    oauth_client: BasicClient::new(
+                        ClientId::new("test-client".to_owned()),
+                        Some(ClientSecret::new("test-secret".to_owned())),
+                        AuthUrl::new("https://accounts.example.test/authorize".to_owned())
+                            .expect("authorization URL"),
+                        Some(TokenUrl::new(token_url.clone()).expect("token URL")),
+                    )
+                    .set_redirect_uri(
+                        RedirectUrl::new(
+                            "https://auth.example.test/auth/google/callback".to_owned(),
+                        )
+                        .expect("redirect URL"),
+                    ),
+                    userinfo_url: reqwest::Url::parse(&userinfo_url).expect("userinfo URL"),
+                }))
+                .service(
+                    web::scope("")
+                        .wrap(auth_security_headers())
+                        .service(google_auth_callback),
+                ),
+        )
+        .await;
+        let resolve_failure_reference = generate_reference_value().unwrap();
+        insert_external(
+            &mut connection,
+            &resolve_failure_reference,
+            &service_id,
+            "resolve-failure",
+        )
+        .await;
+        let users_before_resolve_failure: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM public.internal_users")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let identities_before_resolve_failure: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM public.external_identities WHERE provider = 'google' AND subject = 'google-subject-db-failure'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let sessions_before_resolve_failure =
+            redis_key_count(&mut connection, "auth:session:*").await;
+        let handoffs_before_resolve_failure =
+            redis_key_count(&mut connection, "auth:handoff:*").await;
+        *fake_google.pool_to_close.lock().expect("lock failure pool") = Some(resolve_failure_pool);
+        fake_google.mode.store(5, Ordering::SeqCst);
+        let resolve_failure = actix_web::test::call_service(
+            &resolve_failure_app,
+            actix_web::test::TestRequest::get()
+                .uri(&callback_uri("resolve-failure", &resolve_failure_reference))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(
+            resolve_failure.status(),
+            actix_web::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(resolve_failure.headers().get(header::LOCATION).is_none());
+        assert!(resolve_failure.headers().get(header::SET_COOKIE).is_none());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM public.internal_users")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            users_before_resolve_failure
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM public.external_identities WHERE provider = 'google' AND subject = 'google-subject-db-failure'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            identities_before_resolve_failure
+        );
+        assert_eq!(
+            redis_key_count(&mut connection, "auth:session:*").await,
+            sessions_before_resolve_failure
+        );
+        assert_eq!(
+            redis_key_count(&mut connection, "auth:handoff:*").await,
+            handoffs_before_resolve_failure
+        );
+        assert_eq!(
+            read_external(
+                &mut connection,
+                &resolve_failure_reference,
+                unix_seconds(SystemTime::now()).unwrap(),
+            )
+            .await
+            .unwrap()
+            .status,
+            ExternalStatus::Processing
+        );
+        fake_google.mode.store(0, Ordering::SeqCst);
+
         // 壊れた ExternalAuthTransaction は 503 で Google に到達しない。
         let invalid_redis_reference = generate_reference_value().unwrap();
         insert_external(
@@ -2028,6 +2290,79 @@ mod tests {
             fake_google.token_calls.load(Ordering::SeqCst),
             token_before_invalid_redis
         );
+
+        // callback Luaは型不正をInvalidStoredStateに正規化するため、実Redisの
+        // EVAL/EVALSHA権限拒否でRedisFailureを発生させる。Googleや成功artifactには進まない。
+        let redis_failure_reference = generate_reference_value().unwrap();
+        insert_external(
+            &mut connection,
+            &redis_failure_reference,
+            &service_id,
+            "redis-failure",
+        )
+        .await;
+        let redis_failure_key = crate::redis_state::external_key(&redis_failure_reference);
+        let _: () = redis::cmd("ACL")
+            .arg("SETUSER")
+            .arg("default")
+            .arg("-eval")
+            .arg("-evalsha")
+            .query_async(&mut connection)
+            .await
+            .expect("deny callback Lua commands");
+        assert_eq!(
+            crate::redis_state::claim_external_callback(&mut connection, &redis_failure_reference,)
+                .await,
+            Err(RedisStateError::RedisFailure)
+        );
+        let token_before_redis_failure = fake_google.token_calls.load(Ordering::SeqCst);
+        let userinfo_before_redis_failure = fake_google.userinfo_calls.load(Ordering::SeqCst);
+        let sessions_before_redis_failure =
+            redis_key_count(&mut connection, "auth:session:*").await;
+        let handoffs_before_redis_failure =
+            redis_key_count(&mut connection, "auth:handoff:*").await;
+        let redis_failure = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&callback_uri("redis-failure", &redis_failure_reference))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(
+            redis_failure.status(),
+            actix_web::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(redis_failure.headers().get(header::LOCATION).is_none());
+        assert!(redis_failure.headers().get(header::SET_COOKIE).is_none());
+        assert_eq!(
+            fake_google.token_calls.load(Ordering::SeqCst),
+            token_before_redis_failure
+        );
+        assert_eq!(
+            fake_google.userinfo_calls.load(Ordering::SeqCst),
+            userinfo_before_redis_failure
+        );
+        assert_eq!(
+            redis_key_count(&mut connection, "auth:session:*").await,
+            sessions_before_redis_failure
+        );
+        assert_eq!(
+            redis_key_count(&mut connection, "auth:handoff:*").await,
+            handoffs_before_redis_failure
+        );
+        let _: () = redis::cmd("ACL")
+            .arg("SETUSER")
+            .arg("default")
+            .arg("+eval")
+            .arg("+evalsha")
+            .query_async(&mut connection)
+            .await
+            .expect("restore callback Lua commands");
+        let _: i32 = redis::cmd("DEL")
+            .arg(&redis_failure_key)
+            .query_async(&mut connection)
+            .await
+            .unwrap();
 
         fake_google_handle.stop(true).await;
     }
@@ -3048,12 +3383,6 @@ mod tests {
                 .status,
             UsageStatus::Used
         );
-        sqlx::query("DELETE FROM public.registered_web_services WHERE service_id IN ($1, $2)")
-            .bind(&service_id)
-            .bind(&disabled_service_id)
-            .execute(&pool)
-            .await
-            .expect("cleanup services");
         redis::cmd("DEL")
             .arg(crate::redis_state::handoff_key(&handoff_reference))
             .arg(crate::redis_state::logout_key(&logout_reference))
@@ -3061,5 +3390,55 @@ mod tests {
             .query_async::<()>(&mut connection)
             .await
             .expect("cleanup Redis state");
+
+        // Luaの型検証でInvalidStoredStateにならないよう、全てのexchange検証後に
+        // 接続済みの使い捨てRedisを停止する。以後の実コマンド失敗はRedisFailureであり、
+        // absence/AlreadyUsedではなく503、かつ成功JSONを返さない。
+        let redis_failure_reference = generate_reference_value().expect("Redis failure handoff");
+        write_handoff(
+            &mut connection,
+            &redis_failure_reference,
+            &AuthenticationHandoff {
+                service_id: service_id.clone(),
+                internal_user_id: user_id,
+                common_session_lookup: reference_value_lookup(&session_reference),
+                code_challenge: challenge.clone(),
+                authenticated_at: now - 1,
+                issued_at: now,
+                expires_at: now + 120,
+                status: UsageStatus::Unused,
+            },
+            now,
+        )
+        .await
+        .expect("write Redis failure handoff");
+        let _: redis::RedisResult<()> = redis::cmd("SHUTDOWN")
+            .arg("NOSAVE")
+            .query_async(&mut connection)
+            .await;
+        let redis_failure = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::post()
+                .uri("/auth/handoffs/exchange")
+                .insert_header((header::AUTHORIZATION, basic(&service_id, secret)))
+                .insert_header((header::CONTENT_TYPE, "application/json"))
+                .set_payload(exchange_body(&redis_failure_reference, &verifier))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(
+            redis_failure.status(),
+            actix_web::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        let redis_failure_body =
+            String::from_utf8(actix_web::test::read_body(redis_failure).await.to_vec()).unwrap();
+        assert!(!redis_failure_body.contains("internal_user_id"));
+        assert!(!redis_failure_body.contains("authenticated_at"));
+        sqlx::query("DELETE FROM public.registered_web_services WHERE service_id IN ($1, $2)")
+            .bind(&service_id)
+            .bind(&disabled_service_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup services");
     }
 }
