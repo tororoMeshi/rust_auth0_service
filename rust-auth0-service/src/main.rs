@@ -719,6 +719,26 @@ async fn logout_post(
     }
 }
 
+fn configure_auth_routes(config: &mut web::ServiceConfig) {
+    config.service(
+        web::scope("")
+            .wrap(auth_security_headers())
+            .service(login)
+            .service(google_auth_callback)
+            .service(
+                web::resource("/auth/handoffs/exchange")
+                    .app_data(web::JsonConfig::default().limit(HTTP_BODY_MAX_BYTES))
+                    .route(web::post().to(exchange_auth_handoff)),
+            )
+            .service(
+                web::resource("/auth/logout")
+                    .app_data(web::FormConfig::default().limit(HTTP_BODY_MAX_BYTES))
+                    .route(web::get().to(logout_get))
+                    .route(web::post().to(logout_post)),
+            ),
+    );
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     dotenv().ok();
@@ -796,23 +816,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(google_callback_config.clone())
             .app_data(web::Data::new(postgres_pool.clone()))
             .app_data(web::Data::new(redis_connection.clone()))
-            .service(
-                web::scope("")
-                    .wrap(auth_security_headers())
-                    .service(login)
-                    .service(google_auth_callback)
-                    .service(
-                        web::resource("/auth/handoffs/exchange")
-                            .app_data(web::JsonConfig::default().limit(HTTP_BODY_MAX_BYTES))
-                            .route(web::post().to(exchange_auth_handoff)),
-                    )
-                    .service(
-                        web::resource("/auth/logout")
-                            .app_data(web::FormConfig::default().limit(HTTP_BODY_MAX_BYTES))
-                            .route(web::get().to(logout_get))
-                            .route(web::post().to(logout_post)),
-                    ),
-            )
+            .configure(configure_auth_routes)
     })
     .bind("0.0.0.0:8080")?
     .run()
@@ -822,6 +826,24 @@ async fn main() -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[actix_web::test]
+    async fn t24_legacy_auth_routes_are_unavailable() {
+        let app = actix_web::test::init_service(App::new().configure(configure_auth_routes)).await;
+
+        for (method, path) in [
+            (actix_web::http::Method::GET, "/auth/google"),
+            (actix_web::http::Method::POST, "/upsert_and_token"),
+            (actix_web::http::Method::GET, "/sessions/verify"),
+            (actix_web::http::Method::POST, "/logout"),
+        ] {
+            let request = actix_web::test::TestRequest::with_uri(path)
+                .method(method)
+                .to_request();
+            let response = actix_web::test::call_service(&app, request).await;
+            assert_eq!(response.status(), actix_web::http::StatusCode::NOT_FOUND);
+        }
+    }
 
     #[test]
     fn login_query_rejects_duplicate_required_fields() {
