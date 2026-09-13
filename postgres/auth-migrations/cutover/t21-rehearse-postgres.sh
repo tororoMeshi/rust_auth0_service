@@ -13,7 +13,16 @@ chmod 700 "${rehearsal_dir}"
 
 docker run --rm -d --name "${container}" -e POSTGRES_HOST_AUTH_METHOD=trust \
     -e POSTGRES_DB=auth0_accounts -v "${repo_root}:/work:ro" postgres:17-alpine >/dev/null
-until docker exec "${container}" pg_isready -U postgres -d auth0_accounts >/dev/null 2>&1; do sleep 1; done
+for attempt in $(seq 1 15); do
+    if docker exec "${container}" psql -X -U postgres -d auth0_accounts -c 'SELECT 1' >/dev/null 2>&1; then
+        break
+    fi
+    if [[ "${attempt}" == 15 ]]; then
+        printf 'PostgreSQL readiness timed out after 15 authenticated SELECT 1 probes for auth0_accounts\n' >&2
+        exit 1
+    fi
+    sleep 1
+done
 
 run_sql() { docker exec -i "${container}" psql -X -v ON_ERROR_STOP=1 -U postgres -d auth0_accounts; }
 run_case() {

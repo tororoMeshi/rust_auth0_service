@@ -1,5 +1,15 @@
 # T21 production cutover artifacts
 
+## T25 legacy rollback runtime rehearsal
+
+`./t25-rehearse-legacy-rollback-runtime.sh` は、`docs/auth-foundation-rollback-baseline.md` の不変digestで指定された rust-auth0-service、uniauth、portal_backend、portal frontend を一時 Docker network 上で起動する。production のDB、Redis、Secret、network、routingには接続しない。
+
+このscriptは既存の `t21-prepare-rollback-jwt-secret.sh` で外部一時領域に fresh rollback JWT secret を生成し、旧frontendの `/api/` proxy 経由で旧 `portal_backend` の `/api/me` を検証する。fresh JWT は200、別の一時secretで署名したpre-migration相当JWTと認証なしは401でなければ失敗する。成功・失敗のどちらでもcontainer、network、secret/JWTを含む一時ファイルをcleanupする。
+
+```bash
+postgres/auth-migrations/cutover/t25-rehearse-legacy-rollback-runtime.sh
+```
+
 このディレクトリは通常migrationの対象外です。T21は成果物準備と隔離rehearsalだけであり、production mutation、external workload mutation、`auth0_app`の操作を行いません。
 
 ## Secret
