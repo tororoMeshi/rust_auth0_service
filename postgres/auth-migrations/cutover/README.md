@@ -22,7 +22,7 @@ DB bootstrapはdisabledのままであり、Secret creationは後続cutover phas
 
 ## T26 only ordering
 
-1. writersを停止しmaintenance boundaryを確立する。external consumersはT26 prerequisiteとして記録するだけで変更しない。
+1. writersを停止しmaintenance boundaryを確立する。known external legacy JWT consumer は Gate E または T26 の prerequisite ではなく、external owner confirmation も prerequisite ではない。切替後の互換性は unsupported とする。過去の MIGRATE / RETIRE decision は移行または retirement の完了を意味しない。T26 は external consumer workload を変更しない。
 2. writer停止後にlegacy `users` と `users_id_seq` のactual stateを読む。新identityの次値は `max(users.id)+1` と `last_value` / `is_called` / incrementから算出するactual next値のmaxであり、125をhardcodeしない。
 3. [Backup / own rollback](#backup--own-rollback) のprimary確認とdurable backupを完了・検証する。`auth0_app`をbackup/restore対象へ混在させない。
 4. 既存T05 schemaを通常runnerで適用してから `001_t21_auth_foundation_cutover.sql` を一度だけ適用する。SQLはtarget empty、users.id / google_id / created_at、high-water、dependencyを検証し、異常ならtransactionをSTOPする。
