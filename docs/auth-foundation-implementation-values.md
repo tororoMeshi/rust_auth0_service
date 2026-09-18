@@ -4,6 +4,8 @@
 
 本書は `rust-auth0-service` の共通認証、`portal_backend` のローカル認証、portal のブラウザ経路に適用する。値は初期実装の固定値であり、Secret値そのものは記録しない。開発のbrowser-facing originは `http://localhost:5173`、開発サービスは `portal-dev`、callback は `http://localhost:5173/auth/callback`、logout return は `http://localhost:5173/` とする。
 
+Auth Foundation production cutover は legacy JWT authentication consumer との互換性を維持しない。known legacy JWT consumer が切替後に動作しなくなることは accepted breaking change であり、consumer が migrated または retired 済みである証拠ではない。external consumer の migration、repair、retirement、owner confirmation は Gate E/T26 の prerequisite ではない。互換endpoint、adapter、bridge、dual auth、temporary fallback、migration shim は追加しない。
+
 ## 2. 認証基盤の期限
 
 | 項目 | 値 | 意味 |

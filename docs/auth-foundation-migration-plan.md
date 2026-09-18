@@ -29,13 +29,13 @@
 
 ## 3. 事前検査
 
-legacy uniauth JWT を直接検証する4 consumer の canonical decision は、external release prerequisite として維持する。`stateless-chat/nodejs-room` は **MIGRATE**、`stateless-chat/websocket-chat-api`、`jamaica/play-matching`、`jamaica/matchmaking` は **RETIRE** であり、UNKNOWN は0件である。Track A/B/C はそれぞれ external prerequisite A/B/C であり、rust_auth0_service の implementation workstream ではない。依存は `T20 -> Gate D -> T21 -> T22 -> T23 -> T24 -> T25 -> Gate E -> T26` とする。Redis version blockerは解消済みで、T21 は **READY** である。external owner は source migration/retirement、image、Deployment / Service / Ingress、rollback を所有し、rust_auth0_service は Auth Foundation contract と cutover inputs を提供して external readiness を確認する。新 Auth Foundation は legacy JWT を発行せず、既存 JWT の互換発行、generic shared JWT、compatibility layer は採用しない。
+legacy uniauth JWT を直接検証する4 consumer は known legacy JWT consumer として記録する。過去decisionは `stateless-chat/nodejs-room` = **MIGRATE**、`stateless-chat/websocket-chat-api`、`jamaica/play-matching`、`jamaica/matchmaking` = **RETIRE** であるが、これは完了状態を表さない。Auth Foundation production cutover は legacy JWT consumer との互換性を維持せず、既知consumerは切替後に動作しなくなる場合がある。これは accepted breaking change であり、移行、修復、retirement、external owner confirmation は Gate E/T26 の prerequisite ではない。依存は `T20 -> Gate D -> T21 -> T22 -> T23 -> T24 -> T25 -> Gate E -> T26` とする。Redis version blockerは解消済みで、T21 は **READY** である。external owner は必要に応じて source migration/retirement、image、Deployment / Service / Ingress、rollback を別途所有する。新 Auth Foundation は legacy JWT を発行せず、既存 JWT の互換発行、generic shared JWT、compatibility layer は採用しない。
 
-`nodejs-room` は **MIGRATE** とする。local session design、source implementation、image、Deployment、および rollback は external owner が所有する。
+`nodejs-room` は known legacy JWT consumer であり、過去decisionは **MIGRATE** である。migration は cutover に不要であり、切替後の互換性は unsupported とする。local session design、source implementation、image、Deployment、および rollback は external owner が所有する。
 
-`websocket-chat-api` は **RETIRE** とする。source retirement、image、Deployment / Service / Ingress、および rollback は external owner が所有する。
+`websocket-chat-api` は known legacy JWT consumer であり、過去decisionは **RETIRE** である。retirement は cutover に不要であり、切替後の互換性は unsupported とする。source retirement、image、Deployment / Service / Ingress、および rollback は external owner が所有する。
 
-`play-matching` と `matchmaking` は **RETIRE** とする。source retirement、image、Deployment / Service / Ingress、および rollback は external owner が所有する。
+`play-matching` と `matchmaking` は known legacy JWT consumer であり、過去decisionはそれぞれ **RETIRE** である。retirement は cutover に不要であり、切替後の互換性は unsupported とする。source retirement、image、Deployment / Service / Ingress、および rollback は external owner が所有する。
 
 切替開始前に、PostgreSQL の切替前バックアップ取得方法と同じバックアップからの復元手順を、対象環境で確認する。復元安全性について、認証データが専用データベースまたは専用スキーマに分離されていること、または復元対象範囲へ書き込むすべてのコンポーネントを停止していることのいずれかを保証する。認証以外の処理が同じ復元対象へ書き込み続けている状態で PostgreSQL バックアップを復元しない。復元によって認証以外のデータを巻き戻す可能性がある場合は、一括切替を開始しない。部分的な新旧認証移行や二重書込みによってこの問題を回避しない。既存 `users` 件数を記録し、切替用 DDL、変換手順、Redis Lua の検証を完了する。実行可能な移行 SQL、Redis 削除スクリプト、Lua 本文は本書には記載しない。
 
@@ -90,7 +90,7 @@ production Redis 6.2.6を使用する。保存した`expires_at`とRedis server 
 4. 停止状態の `users` を事前検査済みの手順で `internal_users` と `external_identities` へ一括変換する。件数、ID、外部 ID、一意制約、外部キーを検証し、identity sequence を調整して検証する。異常または不一致ならサービスを再開せず、ロールバック判断へ進む。
 5. 検証後、旧`users`テーブルを切替中に削除する。旧表を DB 内へ残さず、旧データを必要とする場合は切替前 PostgreSQL バックアップだけを用いる。
 6. shared Redis DB0 から安全に識別した旧認証 key だけを削除する。`FLUSHDB` / `FLUSHALL`、認証専用領域の一括破棄、旧状態の変換は行わない。分類不能 key が一件でもあれば削除せず cutover を停止する。
-7. rust_auth0_service の新 Auth Foundation、portal、DB/Secret/Redis migration、own routing を一括適用し、own legacy auth を停止する。これは唯一のproduction一括切替境界である。external owner は同一 cutover window で自らの migration/retirement を実行し、rust_auth0_service は release condition を確認する。新 API だけを公開し、旧 API、JWT 発行・検証、`JWT_SECRET`、親ドメイン Cookie 設定、任意 redirect、`ALLOWED_REDIRECT_ORIGINS` を残さない。
+7. rust_auth0_service の新 Auth Foundation、portal、DB/Secret/Redis migration、own routing を一括適用し、own legacy auth を停止する。これは唯一のproduction一括切替境界であり、rust_auth0_service-owned scope のみを対象とする。external workload は直接変更せず、external consumer の migration/retirement/owner confirmation を待たない。新 API だけを公開し、旧 API、JWT 発行・検証、`JWT_SECRET`、親ドメイン Cookie 設定、任意 redirect、`ALLOWED_REDIRECT_ORIGINS` を残さない。
 8. `portal` と `portal_backend` の Web サービス Secret、PostgreSQL の SHA-256 検証値、完全一致 URI を静的に照合し、認証基盤側と Web サービス側の設定値が一致したことを確認する。設定が一つでも欠ければ有効化しない。
 9. サービス再開前の疎通確認として、メンテナンス状態を維持したまま `registered_web_services` を `is_enabled = true`へ変更する。第7章の最小疎通確認だけを実施し、Google ログイン試験には移行済みの既存Googleアカウントを使用する。そのアカウントが `external_identities` に既に存在することを事前確認する。ロールバック判断が完了するまで、未登録 Google アカウントによるログインを許可せず、疎通確認によって新しい `internal_users` または `external_identities` を作成しない。新規登録を一時的に制御する feature flag は設けず、メンテナンス中に検査用の既存アカウントだけを使う運用手順とする。
 10. 疎通確認成功とロールバック不要の判断後、Web サービスのメンテナンスを解除してサービスを再開する。全利用者には新構成での再ログインを要求する。
@@ -124,7 +124,7 @@ Google ログインを含む確認には移行済みの既存Googleアカウン�
 5. 旧コンポーネントを、新しい `JWT_SECRET` で一括再配備する。
 6. 全利用者へ再ログインを要求する。
 
-旧構成へ戻す場合も、移行前の`JWT_SECRET`を再利用しない。ブラウザに移行前の旧 JWT が残っていても、新しい `JWT_SECRET` では検証に成功しないようにする。Redis セッションの削除だけで旧 JWT が失効するとは扱わない。新旧混在状態での部分ロールバック、新 DB の一部データから旧 DB への逆変換、旧セッションまたは旧 JWT の継続利用を禁止する。external consumer の rollback は external owner が所有する。RETIRE consumerは通常のAuth Foundation rollbackで自動復活させない。rust_auth0_service の rollback は own resources を対象とし、旧認証機能を復旧するものであって、移行前のログイン状態を復元するものではない。
+旧構成へ戻す場合も、移行前の`JWT_SECRET`を再利用しない。ブラウザに移行前の旧 JWT が残っていても、新しい `JWT_SECRET` では検証に成功しないようにする。Redis セッションの削除だけで旧 JWT が失効するとは扱わない。新旧混在状態での部分ロールバック、新 DB の一部データから旧 DB への逆変換、旧セッションまたは旧 JWT の継続利用を禁止する。external consumer の rollback は external owner が所有する。cutover により external consumer が動作しなくなっても、それだけを理由に rust_auth0_service rollback を自動発動しない。rust_auth0_service の rollback は own resources を対象とし、旧認証機能を復旧するものであって、移行前のログイン状態または external consumer を復元するものではない。
 
 ロールバック判断は、新構成で新しいユーザーが作成される前に完了する。この順序により、バックアップ復元後の新規ユーザー差分を扱う必要を作らない。ロールバック後は旧構成へ一括復帰するため、再切替は新しい停止計画としてあらためて実施する。
 
@@ -134,7 +134,7 @@ Google ログインを含む確認には移行済みの既存Googleアカウン�
 
 - 新 API だけが存在し、旧 `/auth/google`、`/upsert_and_token`、`/sessions/verify`、旧 `/logout` は呼出不能である。
 - rust_auth0_service repo/auth0 scope で JWT 発行・検証コードと `JWT_SECRET` が不要であり、親ドメイン共有 Cookie を設定しない。
-- legacy JWT shutdown の coordinated release condition として、全 known external legacy JWT consumer が migrated または retired と external owner により確認済みである。確認がなければ T26 は NO-GO とする。
+- legacy JWT authentication consumer との互換性を維持しない breaking change が受容済みである。known external legacy JWT consumer の migration、repair、retirement、external owner confirmation は T26 の GO/NO-GO 条件ではない。
 - 旧 Redis 認証キーが存在せず、新 Redis は `auth:external:*`、`auth:session:*`、`auth:handoff:*`、`auth:logout:*` の新しい短期状態だけを扱う。
 - 旧`users`テーブルが存在しない。
 - 認証基盤が所有するアプリケーションテーブルは `internal_users`、`external_identities`、`registered_web_services` の3個だけである。
