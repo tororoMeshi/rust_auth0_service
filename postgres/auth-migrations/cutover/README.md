@@ -22,6 +22,10 @@ DB bootstrapはdisabledのままであり、Secret creationは後続cutover phas
 
 ## T26 only ordering
 
+T26実行者は、順序を変えずに各操作を固定する
+[`T26-operator-runbook.md`](T26-operator-runbook.md) を使用する。本runbookに
+`READY` と記録されていないpreflight項目はSTOP条件であり、即興で代替手段を選ばない。
+
 1. writersを停止しmaintenance boundaryを確立する。known external legacy JWT consumer は Gate E または T26 の prerequisite ではなく、external owner confirmation も prerequisite ではない。切替後の互換性は unsupported とする。過去の MIGRATE / RETIRE decision は移行または retirement の完了を意味しない。T26 は external consumer workload を変更しない。
 2. writer停止後にlegacy `users` と `users_id_seq` のactual stateを読む。新identityの次値は `max(users.id)+1` と `last_value` / `is_called` / incrementから算出するactual next値のmaxであり、125をhardcodeしない。
 3. [Backup / own rollback](#backup--own-rollback) のprimary確認とdurable backupを完了・検証する。`auth0_app`をbackup/restore対象へ混在させない。
@@ -62,10 +66,19 @@ t21_backup_dir="$(realpath -e "$T21_BACKUP_DIR")"
 [[ -d "$t21_backup_dir" ]] || { echo 'invalid durable backup directory' >&2; exit 1; }
 case "$t21_backup_dir" in "$t21_repo_root"|"$t21_repo_root"/*) echo 'backup must be outside the repository' >&2; exit 1 ;; esac
 t21_backup_file="$t21_backup_dir/auth0_accounts-pre-t21-$(date -u +%Y%m%dT%H%M%SZ).dump"
+t21_checksum_file="${t21_backup_file}.sha256"
 [[ ! -e "$t21_backup_file" && ! -L "$t21_backup_file" ]] || { echo 'refusing to overwrite backup' >&2; exit 1; }
-kubectl exec -n auth0 "$t21_primary_pod" -- pg_dump -U postgres -Fc -d auth0_accounts >"$t21_backup_file"
+[[ ! -e "$t21_checksum_file" && ! -L "$t21_checksum_file" ]] || { echo 'refusing to overwrite backup checksum' >&2; exit 1; }
+t21_dump_tmp="$(mktemp "$t21_backup_dir/.t21-backup.XXXXXX")"
+kubectl exec -n auth0 "$t21_primary_pod" -- pg_dump -U postgres -Fc -d auth0_accounts >"$t21_dump_tmp"
+ln -T -- "$t21_dump_tmp" "$t21_backup_file" || { echo 'backup destination appeared; STOP' >&2; exit 1; }
+rm -f -- "$t21_dump_tmp"
 [[ -s "$t21_backup_file" ]] || { echo 'empty backup' >&2; exit 1; }
-( cd "$t21_backup_dir" && sha256sum "$(basename "$t21_backup_file")" >"$(basename "$t21_backup_file").sha256" && sha256sum -c "$(basename "$t21_backup_file").sha256" )
+t21_checksum_tmp="$(mktemp "$t21_backup_dir/.t21-checksum.XXXXXX")"
+sha256sum "$t21_backup_file" >"$t21_checksum_tmp"
+ln -T -- "$t21_checksum_tmp" "$t21_checksum_file" || { echo 'backup checksum destination appeared; STOP' >&2; exit 1; }
+rm -f -- "$t21_checksum_tmp"
+sha256sum -c "$t21_checksum_file"
 pg_restore --list "$t21_backup_file" >/dev/null
 ```
 
@@ -87,6 +100,13 @@ pg_restore --list "$t21_backup_file" >/dev/null
 kubectl exec -i -n auth0 "$t21_primary_pod" -- \
   pg_restore --clean --if-exists -U postgres -d auth0_accounts <"$t21_backup_file"
 ```
+
+rollback restore直前の停止対象は`uniauth`、`rust-auth0-service`、
+`portal-backend-deployment`の3つである。通常cutover開始時のwriter-stopは前記2つだけで、
+portal backendを追加しない。restore後の旧runtimeとportal backendの復帰は、既存の
+`docs/auth-foundation-rollback-baseline.md`のlegacy runtime再配備順序に従い、ここで新しい
+sequencingを定義しない。dumpまたは`.sha256`が既存なら、作成前にSTOPする。`ln -T`のexclusive
+placement失敗もSTOPであり、checksum sidecarは上書きされない。
 
 restore後はread-onlyでlegacy `users` row数、`users_id_seq`の`last_value`/`is_called`（backup直前の記録と一致）、およびT05 target tablesがbackup時点の期待状態（今回の切替前backupでは空）であることを確認する。`auth0_app`にはtouchしない。新tableの逆変換はしない。
 
