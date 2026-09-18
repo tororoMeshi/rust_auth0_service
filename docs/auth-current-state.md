@@ -20,9 +20,9 @@
 
 ## 5. PostgreSQL・Redis
 
-PostgreSQL CRは `auth0/auth0-account-db` で、databaseは `auth0_accounts` と `auth0_app` である。認証の復元単位はdatabase `auth0_accounts` とする。schemaは `metric_helpers`、`public`、`user_management`、認証アプリケーションテーブルは `public.users`、列は `id,email,google_id,name,icon_url,created_at` である。`auth0_app` を巻き戻さないため、cluster単位ではなくdatabase単位で復元する。
+PostgreSQL CRは `auth0/auth0-account-db` で、databaseは `auth0_accounts` と `auth0_app` である。schemaは `metric_helpers`、`public`、`user_management`、legacy application table は `public.users`、列は `id,email,google_id,name,icon_url,created_at` である。Option C では `public.users` を残置し、新 Auth Foundation はこれを使用しない。DB restore rollback は切替手順に含めない。
 
-Redis接続先は `rfrm-redisfailover:6379`、DB番号は0である。参照ワークロードはuniauthとrust-auth0-serviceで、確認時点のkey総数は0だった。DB 0は認証用途のため、切替時の破棄対象はDB 0全体である。完全keyとvalueは取得していない。点検時点で空であることと、切替時点でも空であることは同一視しない。
+Redis接続先は `rfrm-redisfailover:6379`、DB番号は0である。参照ワークロードはuniauthとrust-auth0-serviceで、確認時点のkey総数は0だった。DB 0 は shared であり、Option C は legacy key の物理削除を必要としない。新 runtime は legacy format を読まない。完全keyとvalueは取得していない。
 
 ## 6. portal・portal_backend
 
@@ -42,4 +42,4 @@ rust-auth0-serviceは `google-auth-secrets` の `client_id`・`client_secret`、
 
 ## 10. 未確認事項
 
-`fac3387`、`cc09546`、`3e7b618` は存在するがtagとの対応候補であり、生成コミットとして確定していない。portal_backendの生成コミットは不明である。Gitコミット不明は追跡性の未確認事項として残す。T01は稼働PodのimageIDからdigestを取得し、ロールバック参照として固定済みとする。digest指定でレジストリからpullし、旧構成を再配備できることの実証はT21/T25で行う。切替時点のRedis DB 0のkey状態も再確認が必要である。
+`fac3387`、`cc09546`、`3e7b618` は存在するがtagとの対応候補であり、生成コミットとして確定していない。portal_backendの生成コミットは不明である。Gitコミット不明は追跡性の未確認事項として残す。Option C は旧構成再配備を要求しない。切替時点のRedis DB 0のkey状態は新 `auth:*` semantics の確認にだけ用いる。

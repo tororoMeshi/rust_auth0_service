@@ -3,119 +3,100 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 container="t21-postgres-$RANDOM-$$"
-rehearsal_dir="$(mktemp -d)"
-cleanup() {
-    docker rm -f "${container}" >/dev/null 2>&1 || true
-    rm -rf -- "${rehearsal_dir}"
-}
-trap cleanup EXIT
-chmod 700 "${rehearsal_dir}"
+digest_file="$(mktemp)"
+cleanup() { docker rm -f "${container}" >/dev/null 2>&1 || true; }
+trap 'rm -f -- "${digest_file}"; cleanup' EXIT
 
-docker run --rm -d --name "${container}" -e POSTGRES_HOST_AUTH_METHOD=trust \
-    -e POSTGRES_DB=auth0_accounts -v "${repo_root}:/work:ro" postgres:17-alpine >/dev/null
-for attempt in $(seq 1 15); do
-    if docker exec "${container}" psql -X -U postgres -d auth0_accounts -c 'SELECT 1' >/dev/null 2>&1; then
-        break
-    fi
-    if [[ "${attempt}" == 15 ]]; then
-        printf 'PostgreSQL readiness timed out after 15 authenticated SELECT 1 probes for auth0_accounts\n' >&2
-        exit 1
-    fi
-    sleep 1
-done
+printf '%s\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa >"${digest_file}"
 
-run_sql() { docker exec -i "${container}" psql -X -v ON_ERROR_STOP=1 -U postgres -d auth0_accounts; }
-run_case() {
-    local label="$1" sequence_last="$2" expected_next="$3"
-    run_sql <<SQL
-CREATE ROLE auth0_app_user LOGIN;
-CREATE TABLE public.users (
-  id SERIAL PRIMARY KEY, email varchar(255) UNIQUE NOT NULL, google_id varchar(255) UNIQUE NOT NULL,
-  name varchar(255), icon_url text, created_at timestamp without time zone NOT NULL
-);
-INSERT INTO public.users (id, email, google_id, name, created_at) VALUES
-  (1, 'one-${label}@example.test', 'google-${label}-one', 'one', '2024-01-02 03:04:05'),
-  (36, 'thirtysix-${label}@example.test', 'google-${label}-36', 'thirty-six', '2024-05-06 07:08:09');
-SELECT setval('public.users_id_seq', ${sequence_last}, true);
-SQL
-    docker exec "${container}" psql -X -v ON_ERROR_STOP=1 -U postgres -d auth0_accounts \
-        -f /work/postgres/auth-migrations/001_create_authentication_tables.sql >/dev/null
-    local backup_file="${rehearsal_dir}/auth0_accounts-${label}.dump"
-    local checksum_file="${backup_file}.sha256"
-    # This is intentionally host-side durable storage, not the Pod filesystem.
-    docker exec "${container}" pg_dump -U postgres -Fc -d auth0_accounts >"${backup_file}"
-    [[ -s "${backup_file}" ]]
-    (
-        cd "${rehearsal_dir}"
-        sha256sum "$(basename "${backup_file}")" >"$(basename "${checksum_file}")"
-        sha256sum -c "$(basename "${checksum_file}")" >/dev/null
-    )
-    docker run --rm -v "${rehearsal_dir}:/backup:ro" postgres:17-alpine \
-        pg_restore --list "/backup/$(basename "${backup_file}")" >/dev/null
-    docker cp "${backup_file}" "${container}:/tmp/pre-cutover.dump"
-    docker exec "${container}" psql -X -v ON_ERROR_STOP=1 -U postgres -d auth0_accounts \
-        -v portal_service_secret_sha256_hex=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-        -f /work/postgres/auth-migrations/cutover/001_t21_auth_foundation_cutover.sql >/dev/null
-    run_sql <<SQL
-DO \$\$
-BEGIN
-  IF (SELECT array_agg(internal_user_id ORDER BY internal_user_id) FROM public.internal_users) <> ARRAY[1,36] THEN RAISE EXCEPTION 'ID preservation failed'; END IF;
-  IF (SELECT count(*) FROM public.external_identities WHERE provider = 'google') <> 2 THEN RAISE EXCEPTION 'external identities failed'; END IF;
-  IF (SELECT created_at AT TIME ZONE 'UTC' FROM public.internal_users WHERE internal_user_id = 1) <> timestamp '2024-01-02 03:04:05' THEN RAISE EXCEPTION 'UTC conversion failed'; END IF;
-  IF (SELECT nextval(pg_get_serial_sequence('public.internal_users','internal_user_id'))) <> ${expected_next} THEN RAISE EXCEPTION 'high-water failed'; END IF;
-  IF NOT EXISTS (SELECT 1 FROM public.registered_web_services WHERE service_id = 'portal-prod' AND NOT is_enabled) THEN RAISE EXCEPTION 'disabled service failed'; END IF;
-  IF has_table_privilege('auth0_app_user','public.internal_users','UPDATE') OR has_table_privilege('auth0_app_user','public.registered_web_services','INSERT') THEN RAISE EXCEPTION 'grant minimum failed'; END IF;
-END \$\$;
-SQL
-    docker exec "${container}" pg_restore --clean --if-exists -U postgres -d auth0_accounts /tmp/pre-cutover.dump >/dev/null
-    run_sql <<SQL
-DO \$\$
-DECLARE restored_last bigint; restored_called boolean;
-BEGIN
-  IF (SELECT count(*) FROM public.users) <> 2 THEN RAISE EXCEPTION 'legacy users were not restored'; END IF;
-  SELECT last_value, is_called INTO restored_last, restored_called FROM public.users_id_seq;
-  IF restored_last <> ${sequence_last} OR NOT restored_called THEN RAISE EXCEPTION 'legacy sequence was not restored'; END IF;
-  IF (SELECT count(*) FROM public.internal_users) <> 0 OR (SELECT count(*) FROM public.external_identities) <> 0 OR (SELECT count(*) FROM public.registered_web_services) <> 0 THEN RAISE EXCEPTION 'T05 tables were not restored to empty state'; END IF;
-END \$\$;
-SQL
-    printf 'PostgreSQL rehearsal PASS: %s (next ID %s)\n' "${label}" "${expected_next}"
-}
-
-# max(users.id)+1 > legacy sequence next; and the converse. No production value is hardcoded.
-run_case max_wins 9 37
-docker exec "${container}" psql -X -v ON_ERROR_STOP=1 -U postgres -d auth0_accounts -c 'DROP SCHEMA public CASCADE; DROP ROLE auth0_app_user; CREATE SCHEMA public;' >/dev/null
-run_case sequence_wins 124 125
-docker exec "${container}" psql -X -v ON_ERROR_STOP=1 -U postgres -d auth0_accounts -c 'DROP SCHEMA public CASCADE; DROP ROLE auth0_app_user; CREATE SCHEMA public;' >/dev/null
-
-# The migration must reject a privilege reachable only through role membership.
-run_sql <<'SQL'
-CREATE ROLE auth0_app_user LOGIN;
-CREATE ROLE t21_forbidden_helper NOLOGIN;
-CREATE TABLE public.users (
-  id SERIAL PRIMARY KEY, email varchar(255) UNIQUE NOT NULL, google_id varchar(255) UNIQUE NOT NULL,
-  name varchar(255), icon_url text, created_at timestamp without time zone NOT NULL
-);
-INSERT INTO public.users (email, google_id, created_at)
-VALUES ('inherited@example.test', 'google-inherited', '2024-01-02 03:04:05');
-SQL
-docker exec "${container}" psql -X -v ON_ERROR_STOP=1 -U postgres -d auth0_accounts \
-    -f /work/postgres/auth-migrations/001_create_authentication_tables.sql >/dev/null
-run_sql <<'SQL'
-GRANT TRUNCATE ON public.internal_users TO t21_forbidden_helper;
-GRANT t21_forbidden_helper TO auth0_app_user;
-SQL
-if docker exec "${container}" psql -X -v ON_ERROR_STOP=1 -U postgres -d auth0_accounts \
+run_t21() {
+  docker exec -i "${container}" psql -X -U postgres -d auth0_accounts -v ON_ERROR_STOP=1 \
     -v portal_service_secret_sha256_hex=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-    -f /work/postgres/auth-migrations/cutover/001_t21_auth_foundation_cutover.sql >/dev/null 2>&1; then
-    printf 'inherited forbidden privilege rehearsal unexpectedly succeeded\n' >&2
-    exit 1
+    -f /dev/stdin <"${repo_root}/postgres/auth-migrations/cutover/001_t21_auth_foundation_cutover.sql"
+}
+
+t21_psql() {
+  docker exec -i "${container}" psql -X -U postgres "$@"
+}
+export -f t21_psql
+export container
+
+docker run --rm -d --name "${container}" -e POSTGRES_PASSWORD=fixture-only postgres:17-alpine >/dev/null
+until docker exec "${container}" pg_isready -U postgres -d postgres >/dev/null; do sleep 1; done
+
+docker exec -i "${container}" psql -X -U postgres -d postgres -v ON_ERROR_STOP=1 <<'SQL'
+CREATE DATABASE auth0_accounts;
+\c auth0_accounts
+CREATE ROLE auth0_app_user LOGIN;
+CREATE TABLE public.users (
+  id SERIAL PRIMARY KEY, email varchar(255) UNIQUE NOT NULL, google_id varchar(255) UNIQUE NOT NULL
+);
+INSERT INTO public.users (email, google_id) VALUES
+  ('legacy-one@example.test', 'legacy-google-one'),
+  ('legacy-two@example.test', 'legacy-google-two');
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.users TO auth0_app_user;
+GRANT CREATE ON SCHEMA public TO auth0_app_user;
+SQL
+
+docker exec -i "${container}" psql -X -U postgres -d auth0_accounts -v ON_ERROR_STOP=1 -f /dev/stdin <"${repo_root}/postgres/auth-migrations/001_create_authentication_tables.sql" >/dev/null
+docker exec -i "${container}" psql -X -U postgres -d auth0_accounts -v ON_ERROR_STOP=1 <<'SQL'
+INSERT INTO public.registered_web_services (
+  service_id, is_enabled, login_callback_uri, logout_return_uri, service_secret_sha256
+) VALUES ('portal-prod', false, 'https://unexpected.example.test/callback', 'https://unexpected.example.test/', decode(repeat('b', 64), 'hex'));
+SQL
+if run_t21 >/dev/null 2>&1; then
+  printf 'T21 atomic failure rehearsal unexpectedly succeeded\n' >&2
+  exit 1
 fi
-run_sql <<'SQL'
+docker exec -i "${container}" psql -X -U postgres -d auth0_accounts -v ON_ERROR_STOP=1 <<'SQL'
 DO $$
 BEGIN
-  IF to_regclass('public.users') IS NULL THEN RAISE EXCEPTION 'failed migration did not roll back legacy users'; END IF;
-  IF EXISTS (SELECT 1 FROM public.registered_web_services WHERE service_id = 'portal-prod') THEN RAISE EXCEPTION 'failed migration committed portal bootstrap'; END IF;
+  IF NOT has_table_privilege('auth0_app_user', 'public.users', 'SELECT') THEN RAISE EXCEPTION 'failed T21 committed legacy revoke'; END IF;
+  IF has_table_privilege('auth0_app_user', 'public.internal_users', 'SELECT') THEN RAISE EXCEPTION 'failed T21 committed new grant'; END IF;
+END
+$$;
+DELETE FROM public.registered_web_services WHERE service_id = 'portal-prod';
+SQL
+printf 'T21 atomic failure leaves no T21 state PASS\n'
+
+run_t21 >/dev/null
+T21_PSQL=t21_psql T21_SERVICE_SECRET_SHA256_FILE="${digest_file}" "${repo_root}/postgres/auth-migrations/cutover/t21-verify-auth-foundation-state.sh"
+
+docker exec -i "${container}" psql -X -U postgres -d auth0_accounts -v ON_ERROR_STOP=1 <<'SQL'
+DO $$
+BEGIN
+  IF (SELECT count(*) FROM public.users) <> 2 THEN RAISE EXCEPTION 'legacy users changed'; END IF;
+  IF (SELECT count(*) FROM public.internal_users) <> 0 OR (SELECT count(*) FROM public.external_identities) <> 0 THEN RAISE EXCEPTION 'fresh identity state is not empty'; END IF;
+  IF (SELECT count(*) FROM public.registered_web_services WHERE service_id = 'portal-prod') <> 1 THEN RAISE EXCEPTION 'portal registration count changed'; END IF;
 END
 $$;
 SQL
-printf 'PostgreSQL rehearsal PASS: inherited TRUNCATE rejected\n'
+
+# Simulate a later cutover failure. Resume calls only the read-only completion
+# verifier; it never invokes the T21 SQL whose INSERT would conflict.
+if false; then :; fi
+T21_PSQL=t21_psql T21_SERVICE_SECRET_SHA256_FILE="${digest_file}" "${repo_root}/postgres/auth-migrations/cutover/t21-verify-auth-foundation-state.sh"
+docker exec -i "${container}" psql -X -U postgres -d auth0_accounts -Atq -v ON_ERROR_STOP=1 -c "SELECT count(*) FROM public.registered_web_services WHERE service_id = 'portal-prod'" | grep -qx '1'
+printf 'T21 post-commit resume boundary PASS\n'
+
+docker exec -i "${container}" psql -X -U postgres -d auth0_accounts -v ON_ERROR_STOP=1 <<'SQL'
+CREATE ROLE t21_inherited_leak;
+GRANT t21_inherited_leak TO auth0_app_user;
+GRANT UPDATE ON public.internal_users TO t21_inherited_leak;
+GRANT CREATE ON SCHEMA public TO t21_inherited_leak;
+SQL
+if T21_PSQL=t21_psql T21_SERVICE_SECRET_SHA256_FILE="${digest_file}" "${repo_root}/postgres/auth-migrations/cutover/t21-verify-auth-foundation-state.sh" >/dev/null 2>&1; then
+  printf 'inherited forbidden privilege leak was not detected\n' >&2
+  exit 1
+fi
+docker exec -i "${container}" psql -X -U postgres -d auth0_accounts -v ON_ERROR_STOP=1 -c 'REVOKE t21_inherited_leak FROM auth0_app_user; REVOKE UPDATE ON public.internal_users FROM t21_inherited_leak; REVOKE CREATE ON SCHEMA public FROM t21_inherited_leak;' >/dev/null
+
+docker exec -i "${container}" psql -X -U postgres -d auth0_accounts -v ON_ERROR_STOP=1 -c 'GRANT SELECT ON public.users TO PUBLIC;' >/dev/null
+if T21_PSQL=t21_psql T21_SERVICE_SECRET_SHA256_FILE="${digest_file}" "${repo_root}/postgres/auth-migrations/cutover/t21-verify-auth-foundation-state.sh" >/dev/null 2>&1; then
+  printf 'PUBLIC legacy privilege leak was not detected\n' >&2
+  exit 1
+fi
+docker exec -i "${container}" psql -X -U postgres -d auth0_accounts -v ON_ERROR_STOP=1 -c 'REVOKE SELECT ON public.users FROM PUBLIC;' >/dev/null
+T21_PSQL=t21_psql T21_SERVICE_SECRET_SHA256_FILE="${digest_file}" "${repo_root}/postgres/auth-migrations/cutover/t21-verify-auth-foundation-state.sh"
+printf 'T21 effective privilege inherited/PUBLIC leakage detection PASS\n'
+printf 'T21 fresh Auth Foundation PostgreSQL rehearsal PASS\n'

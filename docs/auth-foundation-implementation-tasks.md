@@ -69,9 +69,9 @@ downstream legacy JWT consumer は後続調査で判明した既知consumerで�
 
 判明した consumer は `stateless-chat/nodejs-room`、`stateless-chat/websocket-chat-api`、`jamaica/play-matching`、`jamaica/matchmaking` である。いずれも `uniauth-secrets` の `jwt_secret` を `JWT_SECRET` として参照し、旧 uniauth JWT（`jwt` Cookie、HS256、shared `JWT_SECRET`、`sub` / `exp` claims）を直接検証する。過去decisionは `nodejs-room` = **MIGRATE**、`websocket-chat-api` = **RETIRE**、`play-matching` = **RETIRE**、`matchmaking` = **RETIRE** であるが、これらは migrated または retired の完了記録ではない。切替後の互換性は unsupported とし、既存 JWT の互換発行、generic shared JWT、compatibility layer は採用しない。
 
-`nodejs-room` は known legacy JWT consumer であり、過去decisionは **MIGRATE** である。migration は Auth Foundation cutover に不要であり、切替後の互換性は unsupported とする。local session design、source implementation、image、Deployment、および rollback は external owner が所有する。
+`nodejs-room` は known legacy JWT consumer であり、過去decisionは **MIGRATE** である。migration は Auth Foundation cutover に不要であり、切替後の互換性は unsupported とする。local session design、source implementation、image、Deployment は external owner が所有する。
 
-`websocket-chat-api`、`play-matching`、`matchmaking` は known legacy JWT consumer であり、過去decisionはそれぞれ **RETIRE** である。retirement は Auth Foundation cutover に不要であり、切替後の互換性は unsupported とする。RETIRE 実装、外部リソース削除、および rollback は external owner が所有する。
+`websocket-chat-api`、`play-matching`、`matchmaking` は known legacy JWT consumer であり、過去decisionはそれぞれ **RETIRE** である。retirement は Auth Foundation cutover に不要であり、切替後の互換性は unsupported とする。RETIRE 実装と外部リソース削除は external owner が所有する。
 
 - portalの実経路 `Cloudflare Tunnel -> frontend-service -> frontend Nginx -> portal_backend` が所定のpathだけをbackendへ渡すことを確認する。dead Kubernetes Ingress ruleの存在だけを証拠にしない。
 - auth hostはrust-auth0-serviceへ直接到達し、T20後のactual source route集合がnew auth routesだけである。
@@ -80,16 +80,13 @@ downstream legacy JWT consumer は後続調査で判明した既知consumerで�
 - rust_auth0_service repo/auth0 scope に uniauth、JWT、旧API、親ドメインCookie、旧Redis JSONセッション、不要依存が残っていない。known legacy JWT consumer が切替後に動作することは保証しない。
 - Production cutover intentionally breaks compatibility with legacy JWT authentication consumers. これは accepted product decision であり、consumer が migrated または retired 済みである証拠ではない。external consumer の状態は Gate E/T26 の GO/NO-GO 条件にしない。
 - PostgreSQLとRedisはIngressへ公開されていない。
-- 旧構成を削除したリポジトリ状態でも、T01で固定した不変image digest、Kubernetes構成、旧マニフェストの所在を参照できる。
 
 ### Gate E: 一括移行可能
 
-- T21〜T25が完了し、T21のmigration成果物、T25で検証した配備成果物、およびrollback成果物が準備済みである。
-- T01で取得した旧構成情報を基に、T21でロールバック成果物が完成している。
-- 旧イメージがdigest指定でpull可能である。
-- 旧構成を新しいロールバック用JWT_SECRETで再配備するリハーサルが成功している。
+- T21〜T25が完了し、T05 schema、T21の最小初期化成果物、T25で検証した新 runtime の配備成果物が準備済みである。
+- service secret handling、disabled RegisteredWebService、Redis 6.2 compatibility、HTTP/browser flow、routing、failure-stop、fresh registration smoke の準備が検証済みである。
 - 単体、PostgreSQL、Redis、HTTP、ブラウザ、Kubernetes、リハーサルの代表検証が成功している。
-- production prerequisite と一括切替チェックリストに、未解決の rust_auth0_service-owned cutover blocker がない。external consumer の移行、修復、retirement、owner confirmation はこの条件に含めない。
+- production prerequisite と一括切替チェックリストに、未解決の rust_auth0_service-owned cutover blocker がない。legacy user migration、ID preservation、backup/restore、old runtime rollback、legacy Redis/Cookie cleanup はこの条件に含めない。
 
 ## 4. 実装タスク
 
@@ -107,19 +104,15 @@ downstream legacy JWT consumer は後続調査で判明した既知consumerで�
 
 - `docs/auth-current-state.md`
 - `docs/auth-foundation-implementation-values.md`（新規）
-- `docs/auth-foundation-rollback-baseline.md`（新規）
 
 **実施内容**
 
 - 現在のビルド、テスト、各crate・アプリ起動、PostgreSQL・Redisローカル検証、Kubernetesマニフェスト配置を記録する。
-- portalのViteポート・proxy、portal_backend公開ルート、`users`実スキーマ、Redis共有状況、PostgreSQL復元対象範囲を固定する。
+- portalのViteポート・proxy、portal_backend公開ルート、`users`実スキーマ、Redis共有状況を固定する。
 - Google callback URI、本番・開発の正規URI、既存Secretと設定の配置を固定する。
 - migration、Lua、移行手順、テストの配置先を現行管理方式から確定する。
-- `docs/auth-foundation-rollback-baseline.md`へ、現在本番で稼働中の旧rust-auth0-service、旧uniauth、旧portal_backend、旧portalについて、コンテナイメージのrepository、tag、digestを記録する。可変tagだけでなくdigestを取得する。
-- 同文書へ、現在適用されているDeployment、Service、Ingress、ConfigMap、Secret参照、NetworkPolicyの構成、image tag、Git履歴、Deployment annotation、CI/CD記録から生成Gitコミットを調査し、確認できた候補と根拠を記録する。確定できない場合は追跡性の未確認事項として残す。旧構成のbuildとdeployに必要な手順・成果物の所在を事実として記録する。Secretの平文値は記録せず、Secret名、key名、参照先だけを記録する。
-- イメージdigestまたは旧構成の取得に失敗した場合は、後続実装を開始しない。ロールバック手順そのものや新しいJWT_SECRETはT21で作成する。
 - `docs/auth-foundation-implementation-values.md`へ、正本で決定済みの外部認証トランザクションTTL、共通認証セッションTTL、handoff TTL、共通ログアウト状態TTLを転記する。
-- 同文書へ、LoginStart TTL、LocalSession TTL、LoginStart・LocalSession保持件数上限、メモリ掃除間隔、handoff交換の接続・全体タイムアウト、認証基盤・portalローカルセッション・ブラウザコンテキスト用一時Cookie名、共通・ローカルログアウトのCSRF方式、各HTTP入力の最大長、HTTPリクエストボディ最大サイズ、旧Cookie削除に必要なCookie名とDomainを固定する。
+- 同文書へ、LoginStart TTL、LocalSession TTL、LoginStart・LocalSession保持件数上限、メモリ掃除間隔、handoff交換の接続・全体タイムアウト、認証基盤・portalローカルセッション・ブラウザコンテキスト用一時Cookie名、共通・ローカルログアウトのCSRF方式、各HTTP入力の最大長、HTTPリクエストボディ最大サイズを固定する。
 - 未確定値は現在の実装、利用規模、標準仕様の範囲で最小値を選び、各値に一文の根拠を記録する。初期実装で変更不要な値は汎用設定化せず定数として扱う。
 
 **検証**
@@ -132,10 +125,7 @@ downstream legacy JWT consumer は後続調査で判明した既知consumerで�
 - 実装定数表がレビュー済みである。
 - T02以降で新しい認証設計判断を行う必要がない。
 - Cookie名、TTL、上限、掃除間隔、タイムアウト、CSRF方式が確定している。
-- 旧構成4コンポーネントの不変なイメージdigestが記録済みである。
-- 旧構成の稼働image digest、Kubernetes構成、マニフェスト所在が記録済みである。正確な生成Gitコミットの未特定だけではT01を未完了にしない。
 - Secretの平文を記録していない。
-- ロールバック元情報をT20の削除後に初めて探す必要がない。
 
 ### T02. 共通参照値と入力境界の実装
 
@@ -711,13 +701,13 @@ T16–T19が完了している。
 
 **完了条件**
 
-- uniauthが独立サービスとして存在せず、rust-auth0-serviceが唯一の認証基盤サービスである。ロールバック元情報の取得を現在稼働中のPodだけに依存しない。
+- uniauthが独立サービスとして存在せず、rust-auth0-serviceが唯一の認証基盤サービスである。
 
 ### T21. 一括移行成果物の作成
 
 **目的**
 
-本番切替前にデータ移行・失効・復旧を再現できる成果物を揃える。
+本番切替前に、新 Auth Foundation の最小初期化を再現できる成果物を揃える。
 
 **前提**
 
@@ -725,23 +715,18 @@ T04で管理場所を確定し、**PASS** の Gate D を通過している。T21
 
 **主な変更対象**
 
-- `postgres/confirmation-users.sh`
-- `postgres/postgres-init-sql.yaml`
-- `redis/create_redis.yaml`
+- `postgres/auth-migrations/001_create_authentication_tables.sql`
+- `postgres/auth-migrations/cutover/001_t21_auth_foundation_cutover.sql`
+- `postgres/auth-migrations/cutover/t21-prepare-portal-service-secret.sh`
+- `postgres/auth-migrations/cutover/t21-verify-portal-service-registration.sh`
 
 **実施内容**
 
-- 現行users事前検査、usersから`internal_users`への変換、usersから`external_identities`への変換、件数・ID・外部ID検査、identity sequence調整、旧users削除を、一括切替専用のSQLまたは手順として作成する。
-- `registered_web_services`初期登録、service_secret生成、旧Redisキー安全識別・削除、PostgreSQLバックアップ・復元確認、旧Cookie失効、ロールバック用の新しいJWT_SECRET生成の成果物を作成する。portal-prodのservice_secretはSHA-256検証値を`registered_web_services`へ登録し、同じ平文を`auth0/portal-prod-service-secret`のkey `service_secret`としてcutover成果物へ配置する。具体的なscript/file名はT21実装時に既存管理方式へ合わせて決める。
-- T01で記録したイメージdigestを再確認し、T01で記録した不変image digest、Kubernetes構成、旧マニフェストの所在、設定・Secret参照をロールバック成果物として固定する。必要なイメージがレジストリからpull可能であることを確認する。
-- T01で記録した設定参照を使い、ロールバック用の新しいJWT_SECRETを組み込む手順と、旧構成を不変な成果物から再配備するチェックリストを作成する。可変タグだけをロールバック根拠にせず、T21で稼働中Podを唯一の情報源として初めてdigestを取得しない。
-- legacy user ID を再利用しない。`internal_users` identity sequence の次値は、writer 停止後に観測した `max(users.id) + 1` と legacy `users_id_seq` の実 next value の大きい方にする。現在の観測値は `max(users.id) = 36`、legacy sequence next = `125` であり、例示値は125である。ただし production script に125を hardcode しない。
-- cutover 成果物で runtime role `auth0_app_user` へ最小権限を付与する。`internal_users` は `SELECT` / `INSERT`、`external_identities` は `SELECT` / `INSERT`、`registered_web_services` は `SELECT`、`internal_users` identity sequence は `USAGE` とする。service registration / enable 等の運用 write 権限は付与しない。既存 schema migration `001` をこの時点で変更するとは決めない。
-- Redis DB0 は authentication 専用ではなく shared である。確認済み consumer は少なくとも `auth0/rust-auth0-service`、`auth0/uniauth`、`stateless-chat/nodejs-room`、`stateless-chat/websocket-chat-api` である。forward migration と rollback のいずれでも `FLUSHDB` / `FLUSHALL` を禁止し、安全に識別した key だけを削除する。分類不能 key が一件でもあれば削除せず cutover を停止し、script で推測、自動修復、自動削除をしない。
-- legacy Redis auth state の識別対象は、uniauth の prefix なし24文字 ASCII 英数字 key（string JSON、`user_id` / `expires_at`、TTL 約24h）と、old rust-auth0-service Actix session の prefix なし64文字 ASCII 英数字 key（string JSON map、`oauth_state` 必須、`redirect` 任意、TTL 約24h）である。`auth:external:`、`auth:session:`、`auth:handoff:`、`auth:logout:` は forward 削除対象外である。
-- `jwt` と `session_id` の parent-domain legacy Cookie は `Domain=.tororomeshi.net; Path=/` であり、T21/T25/T26 に browser expiry artifact を含める。旧 Actix Cookie `id`（host-only `auth.tororomeshi.net`; `Path=/`; `Secure`; `HttpOnly`; `SameSite=Lax`）は、旧 Actix Redis session 削除・旧 runtime 停止・新 runtime が読まないことにより server-side invalidation を成立させる。`id` を物理削除するだけの新 route/component は追加しない。
+- T05 Auth Foundation schema を通常 runner で適用し、T21は schema creation を複製しない。
+- `registered_web_services` の `portal-prod` を disabled で初期登録し、service_secret の SHA-256 digest、callback URI、logout URIを固定する。同じ平文は `auth0/portal-prod-service-secret` の `service_secret` として保護された手順で配置する。
+- cutover 成果物で runtime role `auth0_app_user` へ最小権限を付与する。`internal_users` は `SELECT` / `INSERT`、`external_identities` は `SELECT` / `INSERT`、`registered_web_services` は `SELECT`、`internal_users` identity sequence は `USAGE` とする。service registration / enable 等の運用 write 権限は付与しない。
 - production Redis 6.2.6を使用する。論理期限は保存した`expires_at`とRedis `TIME`で判定し、`EXPIREAT`による物理期限はcleanupと早期消滅時のfail-closed defense-in-depthとして扱う。shared Redisまたはoperatorのupgrade、manifest image pin追加はT21の要件ではない。
-- external consumer の rollback は external owner の責務である。cutover により external consumer が動作しなくなっても、それだけを理由に rust_auth0_service rollback を自動発動しない。rust_auth0_service rollback は external consumer を自動復元せず、同名 Secret の存在だけを理由に他 workloadへ Secret を同期しない。
+- `public.users` は残置し、新 runtime role の grant を revoke する。users copy、Google identity copy、numeric ID preservation、sequence high-water、legacy Redis/Cookie physical cleanup、backup/restore、rollback JWT、old runtime rollback は作成しない。
 - 一括切替チェックリストを作成し、SQL本文やShell本文を本タスクリストへ転記しない。
 
 **検証**
@@ -750,7 +735,7 @@ T04で管理場所を確定し、**PASS** の Gate D を通過している。T21
 
 **完了条件**
 
-- 既存internal_user_id維持、全旧ログイン状態無効、全体ロールバックだけを明示できる。上記の sequence high-water、runtime DB grants、shared Redis safety、Cookie expiry、Redis version decision、`nodejs-room` migration rollback scopeを成果物として検証できる。RETIRE consumerの復元参照はauthentication rollback成果物へ混在させない。データ変換、sequence調整、旧users削除は通常migrationに含めず、通常起動、Pod再起動、アプリ更新によって再実行されない。
+- T05 schema、runtime DB grants、disabled portal-prod registration、service secret preparation、read-only registration verification、Redis 6.2 compatibility、failure-stop を検証できる。fresh registration は空の新 identity state から始まり、`public.users` は未使用のまま残る。
 
 ### T22. 単体検証の整備
 
@@ -860,8 +845,7 @@ T21–T24が完了している。
 **実施内容**
 
 - 1 replica、Recreate、Secret、NetworkPolicy、DB・Redis非公開と、`Cloudflare Tunnel -> frontend-service -> frontend Nginx -> portal_backend`のactual portal chainを配置検証する。Ingress path ruleの存在だけをroutingの証拠にせず、auth側はT20後のactual route集合を確認する。
-- T21のバックアップ、データ変換、登録、旧状態失効、復元確認、ロールバック手順を一括移行リハーサルで検証する。
-- 旧イメージdigestを使った全体ロールバック、新しいロールバック用JWT_SECRETで旧JWT認証機能が起動すること、移行前JWTが新しいJWT_SECRETで拒否されること、ロールバック後も全利用者へ再ログインを要求することを確認する。
+- T05/T21 minimal initialization、service registration artifacts、new runtime deployment/config、PostgreSQL 17、Redis 6.2、portal integration、routing/config assumptions、failure-stop を一括切替リハーサルで検証する。
 
 **検証**
 
@@ -889,12 +873,11 @@ Gate Eを通過している。
 
 **実施内容**
 
-- T21の一括切替チェックリストを順に実行し、バックアップ、migration、初期登録、配備、旧状態無効化、公開後確認を行う。
+- T21の一括切替チェックリストを順に実行し、writer-stop、T05 schema、最小初期登録、Secret/verifier、配備、公開後確認を行う。
 - T18〜T20の承認済み成果物を一括適用し、Cloudflare TunnelからServiceへの既存edge構成のまま新経路を公開する。T26でCloudflare routingを再設計しない。
-- T26は唯一のproduction一括切替境界である。rust_auth0_service は Auth Foundation、portal deployment/config、auth DB migration、RegisteredWebService、own Secret、auth Redis migration/invalidation、own routing、legacy auth shutdown、および own rollback を一括適用する。T26 は rust_auth0_service-owned scope のみを対象とし、external workload を直接 mutation しない。
-- known external legacy JWT consumer の migration、repair、retirement、external owner completion confirmation、coordinated external cutover confirmation は T26 の prerequisite ではない。legacy auth shutdown は、legacy JWT consumer との互換性を意図して破る accepted breaking change として実施する。
-- 問題時はT21で定義した全体ロールバックだけを行い、部分互換や二重運用を開始しない。
-- T26実施中に新しいコード、SQL、Lua、YAMLをその場で修正しない。問題が見つかった場合は作業を止め、承認済みの全体ロールバックを行う。
+- T26は唯一のproduction一括切替境界である。rust_auth0_service は Auth Foundation、portal deployment/config、T05/T21、RegisteredWebService、own Secret、own routing、legacy auth shutdown を一括適用する。T26 は rust_auth0_service-owned scope のみを対象とし、external workload を直接 mutation しない。
+- fresh Google registration で internal user と external identity を各1件作成し、同一Google accountの2回目 login が同じ identity と internal user を解決して重複を作らないこと、LocalSession と `/api/me` を確認する。
+- 問題時は STOP、maintenance を維持し、新 Auth Foundation を診断・修正して安全な new-system state から retry する。旧 authentication system、DB、JWT、runtime を復元しない。
 
 **検証**
 

@@ -6,6 +6,8 @@
 
 Auth Foundation production cutover は legacy JWT authentication consumer との互換性を維持しない。known legacy JWT consumer が切替後に動作しなくなることは accepted breaking change であり、consumer が migrated または retired 済みである証拠ではない。external consumer の migration、repair、retirement、owner confirmation は Gate E/T26 の prerequisite ではない。互換endpoint、adapter、bridge、dual auth、temporary fallback、migration shim は追加しない。
 
+互換性やデータ保存は当然には前提にしない。現在の要件で正当化される場合だけを採用し、状態数、migration logic、rollback path、運用作業を実質的に増やすなら、より単純な breaking-change 案を operator/product owner に提示する。互換性を黙って捨てず、採否は operator/product owner が決める。
+
 ## 2. 認証基盤の期限
 
 | 項目 | 値 | 意味 |
@@ -93,7 +95,7 @@ Secretは、Google client secret、PostgreSQL credential、Redis credentialが�
 
 ## 9. 完了判定
 
-すべての期限、上限、Cookie属性、CSRF比較、入力上限が実装・設定・検証で一致していること。開発オリジンに `localhost:8080` を残さず、`http://localhost:5173` を使用すること。共通ログアウトとportalローカルログアウトのCSRF方式を混同しないこと。T01は稼働PodのimageIDからdigestを取得し、ロールバック参照として固定済みとする。T21/T25はdigest指定でレジストリからpullし、旧構成を再配備できることを実証する。
+すべての期限、上限、Cookie属性、CSRF比較、入力上限が実装・設定・検証で一致していること。開発オリジンに `localhost:8080` を残さず、`http://localhost:5173` を使用すること。共通ログアウトとportalローカルログアウトのCSRF方式を混同しないこと。Option C cutover は legacy runtime rollback を前提にしない。
 
 ## 10. 承認
 
