@@ -9,9 +9,77 @@
 - legacy `public.users` は残置し、T05/T21/new runtime は読取り・書込み・変換・削除しない。
 - operator は writer-stop の前に、production smoke に使える Google account へアクセスできることを確認する。email、Google subject、credential、token、固定 internal user ID を repository に記録しない。
 
+## T05 前の operator shell setup
+
+`postgres/apply-auth-migrations.sh` は `PGHOST`、`PGPORT`、`PGDATABASE`、`PGUSER` を必須とし、認証/TLS option を自ら設定しない。T05 の前に、次の block を **xtrace を無効にした一つの interactive operator shell** で実行する。これは `auth0_app` や application role を使わず、production CR で `auth0_accounts` の owner と定義されている `tororomeshi` の既存 credential Secret だけを利用する。password は stdout、stderr、argv、repository、SQL、log に出さない。
+
+`auth0-account-db` Service は selector を持たないため、`kubectl port-forward service/...` は使わない。ready EndpointSlice が指す primary Pod を一意に解決して port-forward の対象にする。`LOCAL_PG_PORT` は既定値 `15432` が既に使用中の場合だけ、未使用の loopback port を明示して上書きできる。
+
+```bash
+set -euo pipefail
+set +x
+unset PGHOST PGPORT PGDATABASE PGUSER PGPASSWORD PGPASSFILE PGSERVICE PGSERVICEFILE PGSSLMODE PGOPTIONS
+
+POSTGRES_NAMESPACE=auth0
+POSTGRES_SERVICE=auth0-account-db
+POSTGRES_REMOTE_PORT=5432
+POSTGRES_DATABASE=auth0_accounts
+POSTGRES_OWNER_SECRET="tororomeshi.${POSTGRES_SERVICE}.credentials.postgresql.acid.zalan.do"
+export PGPORT="${LOCAL_PG_PORT:-15432}"
+
+[[ "$(kubectl -n "${POSTGRES_NAMESPACE}" get service "${POSTGRES_SERVICE}" -o jsonpath='{.spec.ports[0].port}')" == "${POSTGRES_REMOTE_PORT}" ]]
+POSTGRES_PRIMARY_POD="$({ kubectl -n "${POSTGRES_NAMESPACE}" get endpointslice -o json |
+  jq -er --arg service "${POSTGRES_SERVICE}" '
+    [.items[]
+     | select(.metadata.labels["kubernetes.io/service-name"] == $service)
+     | .endpoints[]
+     | select(.conditions.ready == true and .targetRef.kind == "Pod")
+     | .targetRef.name]
+    | unique
+    | if length == 1 then .[0] else error("expected exactly one ready primary endpoint") end'
+  } )"
+
+kubectl -n "${POSTGRES_NAMESPACE}" port-forward "pod/${POSTGRES_PRIMARY_POD}" "${PGPORT}:${POSTGRES_REMOTE_PORT}" &
+POSTGRES_PORT_FORWARD_PID=$!
+trap 'kill "${POSTGRES_PORT_FORWARD_PID}" 2>/dev/null || true; unset PGPASSWORD' EXIT
+
+for _ in {1..30}; do
+  pg_isready -h 127.0.0.1 -p "${PGPORT}" -d "${POSTGRES_DATABASE}" -t 1 >/dev/null 2>&1 && break
+  sleep 1
+done
+pg_isready -h 127.0.0.1 -p "${PGPORT}" -d "${POSTGRES_DATABASE}" -t 1 >/dev/null
+
+export PGHOST=127.0.0.1
+export PGDATABASE="${POSTGRES_DATABASE}"
+export PGUSER="$(kubectl -n "${POSTGRES_NAMESPACE}" get secret "${POSTGRES_OWNER_SECRET}" -o jsonpath='{.data.username}' | base64 --decode)"
+[[ "${PGUSER}" == "tororomeshi" ]]
+export PGPASSWORD="$(kubectl -n "${POSTGRES_NAMESPACE}" get secret "${POSTGRES_OWNER_SECRET}" -o jsonpath='{.data.password}' | base64 --decode)"
+
+[[ "$(psql -X -v ON_ERROR_STOP=1 -Atqc 'SELECT current_database(), current_user;')" == "auth0_accounts|tororomeshi" ]]
+printf 'Read-only PostgreSQL connection verified: %s as %s\n' "${PGDATABASE}" "${PGUSER}"
+```
+
+この block の `psql` は read-only の `SELECT current_database(), current_user` だけを実行する。`PGPASSWORD` は同じ shell の libpq authentication にだけ使用する。TLS option は runner にもこの block にも不要であり、cluster の libpq default を変更しない。T05 から Boundary B までこの shell と port-forward を維持する。cutover 完了または STOP 後にだけ `trap` を実行して port-forward と `PGPASSWORD` を破棄する。
+
+同じ shell で、T21 の plaintext と digest の配置先を repository 外に作る。`/tmp` 配下の operator-owned 0700 directory を run 固有にし、T21/Boundary A/B で同じ path を保持する。ここではファイル内容を作らない。T21 の secret preparation が初めて内容を作る。
+
+```bash
+umask 077
+CUTOVER_SECRET_DIR="$(mktemp -d /tmp/auth0-t26-cutover.XXXXXX)"
+chmod 700 "${CUTOVER_SECRET_DIR}"
+[[ "$(stat -c %U "${CUTOVER_SECRET_DIR}")" == "$(id -un)" ]]
+[[ "$(stat -c %a "${CUTOVER_SECRET_DIR}")" == "700" ]]
+export PORTAL_SERVICE_SECRET_FILE="${CUTOVER_SECRET_DIR}/portal-prod-service-secret"
+export PORTAL_SERVICE_SECRET_DIGEST_FILE="${CUTOVER_SECRET_DIR}/portal-prod-service-secret.sha256"
+export T21_SECRET_FILE="${PORTAL_SERVICE_SECRET_FILE}"
+export T21_SERVICE_SECRET_SHA256_FILE="${PORTAL_SERVICE_SECRET_DIGEST_FILE}"
+: "${PORTAL_SERVICE_SECRET_FILE:?}" "${PORTAL_SERVICE_SECRET_DIGEST_FILE:?}"
+[[ ! -e "${PORTAL_SERVICE_SECRET_FILE}" && ! -e "${PORTAL_SERVICE_SECRET_DIGEST_FILE}" ]]
+```
+
 ## 実行順序
 
-3--9 は一つの operator shell で続けて実行し、そこで保持した replica 数と Secret path を後続 command がそのまま使う。
+上記 setup と 3--9 は一つの operator shell で続けて実行し、そこで保持した PostgreSQL environment、replica 数、Secret path を後続 command がそのまま使う。
 
 1. 最終 clean/preflight を確認する。
 2. 上記の Google account accessibility を人手で確認する。
@@ -46,11 +114,9 @@
    ```
 
 5. T05 `001_create_authentication_tables.sql` を通常 migration runner で適用する。
-6. T21 より先に protected external path を同じ operator shell へ export し、service secret と digest を準備する。plaintext を repository、SQL、stdout、stderr、argv、logs に置かない。
+6. 上記 setup 済みの protected external path で service secret と digest を準備する。plaintext を repository、SQL、stdout、stderr、argv、logs に置かない。
 
    ```bash
-   export T21_SECRET_FILE=/protected/path/portal-prod-service-secret
-   export T21_SERVICE_SECRET_SHA256_FILE=/protected/path/portal-prod-service-secret.sha256
    : "${T21_SECRET_FILE:?}" "${T21_SERVICE_SECRET_SHA256_FILE:?}"
    postgres/auth-migrations/cutover/t21-prepare-portal-service-secret.sh
    [[ -f "${T21_SECRET_FILE}" && -r "${T21_SECRET_FILE}" ]]
