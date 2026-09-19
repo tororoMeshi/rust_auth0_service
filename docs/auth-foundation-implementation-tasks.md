@@ -692,7 +692,6 @@ T16–T19が完了している。
 - auth hostはCloudflare Tunnelからrust-auth0-serviceへ直接到達するため、legacy Rust route/sourceの削除をactual production route集合のenforcementとする。T20でCloudflare設定を変更しない。
 - 新しい一括切替リリース内で旧経路が存在しない状態をリポジトリ上で作り、統合検証とリハーサルを行う。現在稼働中の旧本番環境はT26まで変更しない。
 - T18、T19、T20の成果物を個別に本番へ順次適用せず、本番への新マニフェスト適用、uniauth停止、旧API停止はT26の一括切替で同時に行う。
-- T01でロールバック元情報が固定されていなければ、旧コードや旧マニフェストを削除しない。T20でリポジトリから旧構成を削除しても、T01に記録した不変image digest、Kubernetes構成、旧マニフェストの所在、設定・Secret参照から旧構成を復元するための基準を維持する。
 - T20 の完了は rust_auth0_service repo 内の legacy uniauth/JWT/session/API/deployable artifacts の除去である。system 全体から legacy JWT dependency が消えたことを意味しない。known external consumer の migrated/retired 確認は不要であり、T26 で旧認証を停止するための release condition として扱わない。
 
 **検証**
@@ -823,37 +822,24 @@ T12、T15–T20が完了している。
 
 - 新経路だけで認証・SSO・失効が成立し、旧クライアント状態は利用できない。
 
-### T25. Kubernetes配置と一括移行リハーサル
+### T25. Kubernetes 配備・設定 preflight
 
 **目的**
 
-本番と同じ構成で配置条件と移行手順の成立を確認する。
+コミット済みの新 runtime、portal、backend の manifest/configuration を再現可能に組み立て、名前・Secret/config 参照・routing ownership が既に検証済みの新設計と一致することだけを確認する。
 
 **前提**
 
-T21–T24が完了している。
-
-**主な変更対象**
-
-- `rust-auth0-service/yaml/deploy.yaml`
-- `rust-auth0-service/yaml/ingress.yaml`
-- `portal/k8s/frontend-configmap.yaml`
-- `portal_backend/k8s/deploy.yaml`
-- `portal_backend/k8s/backend-networkpolicy.yaml`
-- `portal_backend/k8s/backend-configmap.yaml`
+T21–T24 が完了している。
 
 **実施内容**
 
-- 1 replica、Recreate、Secret、NetworkPolicy、DB・Redis非公開と、`Cloudflare Tunnel -> frontend-service -> frontend Nginx -> portal_backend`のactual portal chainを配置検証する。Ingress path ruleの存在だけをroutingの証拠にせず、auth側はT20後のactual route集合を確認する。
-- T05/T21 minimal initialization、service registration artifacts、new runtime deployment/config、PostgreSQL 17、Redis 6.2、portal integration、routing/config assumptions、failure-stop を一括切替リハーサルで検証する。
-
-**検証**
-
-- Kubernetes配置とリハーサル中の正常ログイン、SSO、再起動、障害停止を確認する。
+- `postgres/auth-migrations/cutover/t25-validate-deployment-config.sh` を実行する。これは committed manifest の client-side render/parse と、`rust-auth0-service`、`frontend`、`portal-backend` の Deployment/Service、`portal-prod-service-secret` 参照、frontend Nginx の portal routing を限定して照合する。
+- T22 の単体検証、T23 の PostgreSQL/Redis 6.2 と failure-stop、T24 の HTTP/browser flow と failure behavior はそれぞれの既存証拠を参照し、T25で再実装・再リハーサルしない。
 
 **完了条件**
 
-- Gate Eの全条件を満たし、本番一括切替の入力が確定している。
+- preflight が PASS し、committed deployment/configuration の実行入力が新アーキテクチャと一致する。legacy rollback、backup、旧 runtime、汎用 Kubernetes test environment は対象外である。
 
 ### T26. 一括切替の実施
 
@@ -867,8 +853,7 @@ Gate Eを通過している。
 
 **主な変更対象**
 
-- T21で作成した一括切替チェックリスト
-- T21で作成したデータ移行成果物
+- T21 の最小初期化と service registration 成果物
 - T18〜T20で完成し、T25で検証済みの配備成果物
 
 **実施内容**
@@ -877,7 +862,7 @@ Gate Eを通過している。
 - T18〜T20の承認済み成果物を一括適用し、Cloudflare TunnelからServiceへの既存edge構成のまま新経路を公開する。T26でCloudflare routingを再設計しない。
 - T26は唯一のproduction一括切替境界である。rust_auth0_service は Auth Foundation、portal deployment/config、T05/T21、RegisteredWebService、own Secret、own routing、legacy auth shutdown を一括適用する。T26 は rust_auth0_service-owned scope のみを対象とし、external workload を直接 mutation しない。
 - fresh Google registration で internal user と external identity を各1件作成し、同一Google accountの2回目 login が同じ identity と internal user を解決して重複を作らないこと、LocalSession と `/api/me` を確認する。
-- 問題時は STOP、maintenance を維持し、新 Auth Foundation を診断・修正して安全な new-system state から retry する。旧 authentication system、DB、JWT、runtime を復元しない。
+- 問題時は STOP し、completed boundary を確認して新 Auth Foundation の最初の incomplete/new-system failure を診断・修正して retry する。旧 authentication system、DB、JWT、runtime を復元しない。
 
 **検証**
 
@@ -891,9 +876,9 @@ Gate Eを通過している。
 
 検証はT22の単体、T23のPostgreSQL統合・Redis統合、T24のHTTP統合・ブラウザフロー、T25のKubernetes配置・一括移行リハーサルに分ける。正常ログイン、SSO、LoginStart不一致、別ブラウザ、PKCE不一致、無効サービス、無効ユーザー、handoff期限切れ・再利用・同時交換、callback二重処理、Redis障害、PostgreSQL障害、portal_backend再起動、handoff交換レスポンス喪失、ローカルログアウト、共通ログアウト、旧JWT・旧Cookie・旧API・uniauthの拒否を、該当タスクの最小代表ケースとして確認する。
 
-## 6. 一括移行
+## 6. 一括切替
 
-T05の通常schema migrationで新3テーブルを作成する。T21では事前検査、users変換、sequence調整、users削除、サービス初期登録、Secret生成、旧Redisキー処理、バックアップ・復元、Cookie失効、不変なロールバック成果物、一括切替チェックリストを成果物化する。T25で同じ順序をリハーサルし、Gate E通過後にだけT26で一括切替する。移行中の障害に対して互換経路、二重書込み、部分ロールバックは使わない。
+T05 の通常 schema migration で新3テーブルを作成する。T21 は同じ operator shell が保持する prepared digest を入力に disabled service registration を一度だけ初期化し、Secret配置後に Boundary A（enabled=false）を read-only verifier で確認する。新 runtime/routing 配備後に明示的に enable し、Boundary B（enabled=true）を別の read-only check で確認する。T25 は committed deployment/configuration の最小 preflight を行う。Gate E通過後にだけT26で一括切替する。legacy user/identity/ID の変換・保存、legacy Redis/Cookie の物理 cleanup、backup/restore、旧 runtime の再配備は行わない。失敗時は STOP し、completed boundary を確認して最初の未完了の安全な step から再開する。
 
 ## 7. 完了条件
 

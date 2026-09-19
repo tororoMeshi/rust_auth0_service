@@ -72,7 +72,7 @@ portal_backend再起動時は、メモリ上のLoginStartとLocalSessionが消�
 
 ## 7. 現在実装との差分
 
-現在のHEADは想定基準コミット `ea160810824ade97709ee66cc5c89183f80e1f0d`（`ea16081 docs: define authentication implementation tasks`）と一致している。T01は稼働PodのimageIDからdigestを取得し、ロールバック参照として固定済みとする。T21/T25はdigest指定でレジストリからpullし、旧構成を再配備できることを実証する。現在の作業ツリーにはリポジトリ変更を加えない。
+本書の想定基準コミットは `ea160810824ade97709ee66cc5c89183f80e1f0d`（`ea16081 docs: define authentication implementation tasks`）である。Option C は旧構成の再配備を実証せず、T21/T25は新 Auth Foundation の初期化と配備設定だけを検証する。
 
 | 現在 | 目標 | 物理的な変更 |
 |---|---|---|

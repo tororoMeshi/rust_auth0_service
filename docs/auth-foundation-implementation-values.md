@@ -55,9 +55,9 @@ portal_backend は `replicas: 1` と `Recreate` を前提にプロセスメモ�
 | `__Host-portal_login_ctx` | `Path=/`; `Secure`; `HttpOnly`; `SameSite=Lax`; Domainなし | LoginStartのブラウザ結合 |
 | `__Host-portal_csrf` | `Path=/`; `Secure`; HttpOnlyなし; `SameSite=Lax`; Domainなし | portalローカルログアウトCSRF平文 |
 
-旧 Cookie の `jwt` と `session_id` は `Domain=.tororomeshi.net`、`Path=/` である。T21/T25/T26 は browser expiry artifact を持ち、新しい恒久 runtime endpoint を追加せずにこれらを失効する配信方式を成果物設計で確定する。親ドメイン共有CookieおよびJWT Cookieは移行完了時に残さない。
+旧 Cookie の `jwt` と `session_id` は `Domain=.tororomeshi.net`、`Path=/` である。Option C はこれらの物理的な失効・削除成果物を要求しない。新 runtime は旧 Cookie を受け付けず、親ドメイン共有CookieおよびJWT Cookieに依存しない。
 
-旧 Actix Cookie `id` は host-only `auth.tororomeshi.net`、`Path=/`、`Secure`、`HttpOnly`、`SameSite=Lax` である。旧 Actix Redis session の削除、旧 runtime の停止、新 runtime が `id` を読まないことにより server-side invalidation を成立させる。物理削除のためだけの新 route/component は追加しない。
+旧 Actix Cookie `id` は host-only `auth.tororomeshi.net`、`Path=/`、`Secure`、`HttpOnly`、`SameSite=Lax` である。Option C は旧 Actix Redis session の削除を要求しない。新 runtime は `id` を読まず、旧 credential と旧 runtime/routes を受け付けない。物理削除のためだけの新 route/component は追加しない。
 
 ## 6. CSRF
 
@@ -132,7 +132,7 @@ T19のproduction portal routing planeは `Cloudflare Tunnel -> frontend-service 
 
 `backend-config`は通常設定2値だけを持ち、旧`NODE_ENV`、`PORT`、`FRONTEND_URL`は除去する。`PORT=3000`はDeploymentの既存literal値を維持する。Deploymentは`replicas: 1`、`strategy.type: Recreate`とし、旧`FRONTEND_URL`および`JWT_SECRET`/`uniauth-secrets`参照を削除する。LoginStartとLocalSessionはprocess memoryであるため、新旧Podを並存させない。
 
-T19は `PORTAL_SERVICE_SECRET` を `secretKeyRef` のname `portal-prod-service-secret`、key `service_secret`へ配線するだけで、実Secret値、fake secret、plaintextを作成・commitしない。T21でportal-prodの平文service_secretを生成し、そのSHA-256検証値を`registered_web_services`へ登録し、同じ平文を`auth0/portal-prod-service-secret`のkey `service_secret`としてcutover成果物へ配置する。具体的なscript/file名はT21実装時に既存の管理方式へ合わせて決める。production Kubernetesへportal-devまたはportal-dev用Secretを置かず、developmentはT17/local設定に限定する。
+T19は `PORTAL_SERVICE_SECRET` を `secretKeyRef` のname `portal-prod-service-secret`、key `service_secret`へ配線するだけで、実Secret値、fake secret、plaintextを作成・commitしない。T26の同じoperator shellでprotected external pathにportal-prodの平文service_secretとそのSHA-256検証値を準備し、digestをT21の`registered_web_services`登録へ渡し、同じ平文を`auth0/portal-prod-service-secret`のkey `service_secret`として配置する。production Kubernetesへportal-devまたはportal-dev用Secretを置かず、developmentはT17/local設定に限定する。
 
 portal_backendのNetworkPolicyは `podSelector.matchLabels.app: portal-backend` とする。ingressは同一namespaceの`app: frontend`からTCP 3000だけを許可し、`app: backend`自己許可やCloudflare Podからの直接許可を作らない。egressは、namespace `kube-system`かつ`k8s-app: kube-dns`へのUDP/TCP 53と、`ipBlock.cidr: 0.0.0.0/0`へのTCP 443だけを許可し、TCP 5432と6379のallow ruleを作らない。portal_backendはDB/Redis client自体を持たない。対象Podへ別のallow-allまたは加算的egress policyが存在しないことをT19で再確認する。
 

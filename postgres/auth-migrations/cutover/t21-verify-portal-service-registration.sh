@@ -2,8 +2,13 @@
 set -euo pipefail
 set +x
 
-# Read-only pre-enable verifier. It neither changes PostgreSQL nor Kubernetes.
+# Read-only portal service verifier. It neither changes PostgreSQL nor Kubernetes.
 secret_file="${T21_SECRET_FILE:?T21_SECRET_FILE must name the protected plaintext artifact}"
+expected_enabled="${T21_EXPECTED_ENABLED:-false}"
+case "${expected_enabled}" in
+    false|true) ;;
+    *) printf 'T21_EXPECTED_ENABLED must be false or true\n' >&2; exit 2 ;;
+esac
 [[ -f "${secret_file}" && ! -L "${secret_file}" && -r "${secret_file}" ]] || {
     printf 'protected plaintext artifact is not a readable regular file\n' >&2
     exit 2
@@ -14,7 +19,7 @@ db_hash="$(psql -X -At -v ON_ERROR_STOP=1 -d auth0_accounts -c "
 SELECT encode(service_secret_sha256, 'hex')
   FROM public.registered_web_services
  WHERE service_id = 'portal-prod'
-   AND is_enabled = false
+   AND is_enabled = ${expected_enabled}
    AND login_callback_uri = 'https://portal.tororomeshi.net/auth/callback'
    AND logout_return_uri = 'https://portal.tororomeshi.net/';
 ")" || {
@@ -36,4 +41,4 @@ kubernetes_hash="$(kubectl get secret portal-prod-service-secret -n auth0 \
     exit 1
 }
 
-printf 'portal service registration verification PASS\n'
+printf 'portal service registration verification PASS (enabled=%s)\n' "${expected_enabled}"
