@@ -15,7 +15,7 @@ spec:
     spec:
       containers:
       - name: rust-auth0-service
-        image: tororomeshi/rust_auth0_service:20260506-fac3387
+        image: docker.io/tororomeshi/rust_auth0_service@sha256:125783bb2fdfbe9e4a63bff5c1c48dd7b5ae974ae779cfd36c4ddbd15e82fbfe
         imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 8080
