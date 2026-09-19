@@ -45,6 +45,8 @@ spec:
             value: "5432"
           - name: PGDATABASE
             value: "auth0_accounts"
+          - name: PGSSLMODE
+            value: "require"
           - name: PGUSER
             valueFrom:
               secretKeyRef:

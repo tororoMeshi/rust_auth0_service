@@ -26,7 +26,7 @@ use oauth2::{
     Scope, TokenUrl,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::PgPool;
 use std::{env, io, time::SystemTime};
 
@@ -75,6 +75,7 @@ struct AuthFoundationConfig {
     pg_database: String,
     pg_user: String,
     pg_password: String,
+    pg_ssl_mode: PgSslMode,
 }
 
 impl AuthFoundationConfig {
@@ -98,6 +99,22 @@ impl AuthFoundationConfig {
             pg_database: required_nonempty_env("PGDATABASE")?,
             pg_user: required_nonempty_env("PGUSER")?,
             pg_password: required_nonempty_env("PGPASSWORD")?,
+            pg_ssl_mode: match env::var("PGSSLMODE") {
+                Err(env::VarError::NotPresent) => PgSslMode::Prefer,
+                Ok(value) if value == "require" => PgSslMode::Require,
+                Ok(value) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("unsupported PGSSLMODE value: {value:?}"),
+                    ));
+                }
+                Err(env::VarError::NotUnicode(_)) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "PGSSLMODE environment variable must be valid Unicode",
+                    ));
+                }
+            },
         })
     }
 }
@@ -751,7 +768,8 @@ async fn main() -> std::io::Result<()> {
         .port(auth_foundation_config.pg_port)
         .database(&auth_foundation_config.pg_database)
         .username(&auth_foundation_config.pg_user)
-        .password(&auth_foundation_config.pg_password);
+        .password(&auth_foundation_config.pg_password)
+        .ssl_mode(auth_foundation_config.pg_ssl_mode);
     let postgres_pool: PgPool = PgPoolOptions::new()
         .connect_with(postgres_options)
         .await
