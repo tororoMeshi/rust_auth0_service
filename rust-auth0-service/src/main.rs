@@ -755,12 +755,7 @@ async fn main() -> std::io::Result<()> {
     let postgres_pool: PgPool = PgPoolOptions::new()
         .connect_with(postgres_options)
         .await
-        .map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::ConnectionRefused,
-                "failed to connect to PostgreSQL",
-            )
-        })?;
+        .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
     info!("PostgreSQL connection established");
 
     let redis_client =
