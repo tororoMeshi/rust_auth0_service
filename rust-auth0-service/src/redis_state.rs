@@ -1,4 +1,5 @@
 use crate::auth_foundation::{is_unexpired, reference_value_lookup};
+use log::error;
 use redis::{aio::MultiplexedConnection, Script, Value};
 use std::collections::BTreeMap;
 
@@ -337,6 +338,7 @@ pub(crate) async fn write_external(
 ) -> Result<(), RedisStateError> {
     write_state(
         connection,
+        "external",
         external_key(reference),
         encode_external(state),
         state.expires_at,
@@ -353,6 +355,7 @@ pub(crate) async fn write_session(
 ) -> Result<(), RedisStateError> {
     write_state(
         connection,
+        "session",
         session_key(reference),
         encode_session(state),
         state.expires_at,
@@ -369,6 +372,7 @@ pub(crate) async fn write_handoff(
 ) -> Result<(), RedisStateError> {
     write_state(
         connection,
+        "handoff",
         handoff_key(reference),
         encode_handoff(state),
         state.expires_at,
@@ -385,6 +389,7 @@ pub(crate) async fn write_logout(
 ) -> Result<(), RedisStateError> {
     write_state(
         connection,
+        "logout",
         logout_key(reference),
         encode_logout(state),
         state.expires_at,
@@ -666,6 +671,7 @@ fn script_error<T>(code: i64) -> Result<T, RedisStateError> {
 
 async fn write_state(
     connection: &mut MultiplexedConnection,
+    state_family: &'static str,
     key: String,
     fields: Vec<(&'static str, String)>,
     expires_at: u64,
@@ -682,14 +688,69 @@ async fn write_state(
     }
     hset.query_async::<()>(connection)
         .await
-        .map_err(|_| RedisStateError::RedisFailure)?;
+        .map_err(|redis_error| {
+            redis_write_failure(state_family, RedisWriteOperation::Hset, &redis_error)
+        })?;
 
     redis::cmd("EXPIREAT")
         .arg(&key)
         .arg(expires_at)
         .query_async::<()>(connection)
         .await
-        .map_err(|_| RedisStateError::RedisFailure)
+        .map_err(|redis_error| {
+            redis_write_failure(state_family, RedisWriteOperation::Expireat, &redis_error)
+        })
+}
+
+fn redis_write_failure(
+    state_family: &'static str,
+    operation: RedisWriteOperation,
+    redis_error: &redis::RedisError,
+) -> RedisStateError {
+    error!(
+        "{}",
+        redis_write_failure_message(state_family, operation, redis_error)
+    );
+    RedisStateError::RedisFailure
+}
+
+fn redis_write_failure_message(
+    state_family: &'static str,
+    operation: RedisWriteOperation,
+    redis_error: &redis::RedisError,
+) -> String {
+    format!(
+        "component=redis_state state_family={state_family} operation={} redis_error_kind={:?} redis_error_code={}",
+        operation.as_str(),
+        redis_error.kind(),
+        safe_redis_error_code(redis_error.code())
+    )
+}
+
+#[derive(Clone, Copy)]
+enum RedisWriteOperation {
+    Hset,
+    Expireat,
+}
+
+impl RedisWriteOperation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Hset => "hset",
+            Self::Expireat => "expireat",
+        }
+    }
+}
+
+fn safe_redis_error_code(code: Option<&str>) -> &str {
+    code.filter(|value| {
+        !value.is_empty()
+            && value.len() <= 64
+            && value.bytes().all(|byte| {
+                byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-'
+            })
+    })
+    .unwrap_or("none")
 }
 
 async fn read_fields(
@@ -1131,6 +1192,94 @@ mod tests {
         assert_eq!(COMMON_SESSION_TTL_SECONDS, 28_800);
         assert_eq!(AUTHENTICATION_HANDOFF_TTL_SECONDS, 120);
         assert_eq!(COMMON_LOGOUT_TRANSACTION_TTL_SECONDS, 600);
+    }
+
+    #[test]
+    fn redis_write_failure_messages_distinguish_operations_without_transaction_data() {
+        let redis_error = redis::RedisError::from((
+            redis::ErrorKind::ResponseError,
+            "test Redis response error",
+            "redis://user:password@example.test/0 auth:external:opaque state=secret".to_owned(),
+        ));
+
+        let hset = redis_write_failure_message("external", RedisWriteOperation::Hset, &redis_error);
+        let expireat =
+            redis_write_failure_message("external", RedisWriteOperation::Expireat, &redis_error);
+
+        assert_eq!(
+            hset,
+            "component=redis_state state_family=external operation=hset redis_error_kind=ResponseError redis_error_code=ERR"
+        );
+        assert_eq!(
+            expireat,
+            "component=redis_state state_family=external operation=expireat redis_error_kind=ResponseError redis_error_code=ERR"
+        );
+        for message in [&hset, &expireat] {
+            assert!(!message.contains("password"));
+            assert!(!message.contains("auth:external"));
+            assert!(!message.contains("state=secret"));
+        }
+    }
+
+    #[test]
+    fn redis_error_codes_are_limited_to_safe_tokens() {
+        assert_eq!(safe_redis_error_code(Some("ERR")), "ERR");
+        assert_eq!(safe_redis_error_code(Some("READONLY")), "READONLY");
+        assert_eq!(safe_redis_error_code(Some("credential=secret")), "none");
+    }
+
+    async fn redis_write_failure_integration(
+        redis_url_variable: &str,
+        reference: &str,
+        hset_succeeds: bool,
+    ) {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let redis_url = std::env::var(redis_url_variable)
+            .unwrap_or_else(|_| panic!("{redis_url_variable} must be set for ignored test"));
+        let client = redis::Client::open(redis_url).expect("test Redis URL must be valid");
+        let mut connection = client
+            .get_multiplexed_async_connection()
+            .await
+            .expect("test Redis connection");
+        let key = external_key(reference);
+
+        assert_eq!(
+            write_external(&mut connection, reference, &external(), 100).await,
+            Err(RedisStateError::RedisFailure)
+        );
+        let exists: bool = redis::cmd("EXISTS")
+            .arg(&key)
+            .query_async(&mut connection)
+            .await
+            .expect("check failed write key");
+        assert_eq!(exists, hset_succeeds);
+        let _: () = redis::cmd("DEL")
+            .arg(&key)
+            .query_async(&mut connection)
+            .await
+            .expect("clear failed write key");
+    }
+
+    #[actix_web::test]
+    #[ignore = "requires AUTH_FOUNDATION_TEST_REDIS_HSET_FAILURE_URL for disposable Redis 6.2.6 with HSET renamed"]
+    async fn redis_hset_failure_integration() {
+        redis_write_failure_integration(
+            "AUTH_FOUNDATION_TEST_REDIS_HSET_FAILURE_URL",
+            "t26-hset-failure",
+            false,
+        )
+        .await;
+    }
+
+    #[actix_web::test]
+    #[ignore = "requires AUTH_FOUNDATION_TEST_REDIS_EXPIREAT_FAILURE_URL for disposable Redis 6.2.6 with EXPIREAT renamed"]
+    async fn redis_expireat_failure_integration() {
+        redis_write_failure_integration(
+            "AUTH_FOUNDATION_TEST_REDIS_EXPIREAT_FAILURE_URL",
+            "t26-expireat-failure",
+            true,
+        )
+        .await;
     }
 
     #[actix_web::test]
