@@ -216,7 +216,7 @@ struct LogoutForm {
 async fn start_google_login(
     query: &LoginQuery,
     google_config: &GoogleAuthorizationConfig,
-    redis_connection: &web::Data<redis::aio::MultiplexedConnection>,
+    connection: &mut redis::aio::MultiplexedConnection,
     now: u64,
 ) -> HttpResponse {
     let oauth_state = match generate_reference_value() {
@@ -250,8 +250,7 @@ async fn start_google_login(
         expires_at,
         status: ExternalStatus::Waiting,
     };
-    let mut connection = redis_connection.get_ref().clone();
-    if write_external(&mut connection, &oauth_state, &transaction, now)
+    if write_external(connection, &oauth_state, &transaction, now)
         .await
         .is_err()
     {
@@ -268,7 +267,7 @@ async fn login(
     request: HttpRequest,
     query: web::Query<LoginQuery>,
     postgres_pool: web::Data<PgPool>,
-    redis_connection: web::Data<redis::aio::MultiplexedConnection>,
+    redis_client: web::Data<redis::Client>,
     google_config: web::Data<GoogleAuthorizationConfig>,
 ) -> HttpResponse {
     let query = query.into_inner();
@@ -291,12 +290,19 @@ async fn login(
         Ok(value) => value,
         Err(_) => return HttpResponse::ServiceUnavailable().finish(),
     };
+    let mut connection = match redis_client.get_multiplexed_tokio_connection().await {
+        Ok(value) => value,
+        Err(_) => {
+            error!("authentication storage unavailable");
+            return HttpResponse::ServiceUnavailable().finish();
+        }
+    };
     let Some(cookie) = request.cookie(AUTH_SESSION_COOKIE_NAME) else {
-        return start_google_login(&query, google_config.get_ref(), &redis_connection, now).await;
+        return start_google_login(&query, google_config.get_ref(), &mut connection, now).await;
     };
     let common_session_reference = cookie.value();
     if validate_fixed_reference_value(common_session_reference).is_err() {
-        return start_google_login(&query, google_config.get_ref(), &redis_connection, now).await;
+        return start_google_login(&query, google_config.get_ref(), &mut connection, now).await;
     }
     let callback_url = match valid_callback_url(&callback_uri) {
         Some(value) => value,
@@ -305,12 +311,10 @@ async fn login(
             return HttpResponse::ServiceUnavailable().finish();
         }
     };
-    let mut connection = redis_connection.get_ref().clone();
     let session = match read_session(&mut connection, common_session_reference, now).await {
         Ok(value) => value,
         Err(RedisStateError::NotFound | RedisStateError::Expired) => {
-            return start_google_login(&query, google_config.get_ref(), &redis_connection, now)
-                .await
+            return start_google_login(&query, google_config.get_ref(), &mut connection, now).await
         }
         Err(_) => {
             error!("authentication storage unavailable");
@@ -356,8 +360,7 @@ async fn login(
     {
         Ok(()) => {}
         Err(RedisStateError::NotFound | RedisStateError::Expired) => {
-            return start_google_login(&query, google_config.get_ref(), &redis_connection, now)
-                .await
+            return start_google_login(&query, google_config.get_ref(), &mut connection, now).await
         }
         Err(_) => {
             error!("authentication storage unavailable");
@@ -410,7 +413,7 @@ fn normalize_google_user_info(user_info: GoogleUserInfo) -> Result<NormalizedExt
 async fn google_auth_callback(
     query: web::Query<CallbackQuery>,
     postgres_pool: web::Data<PgPool>,
-    redis_connection: web::Data<redis::aio::MultiplexedConnection>,
+    redis_client: web::Data<redis::Client>,
     google_config: web::Data<GoogleCallbackConfig>,
 ) -> HttpResponse {
     let query = query.into_inner();
@@ -422,7 +425,13 @@ async fn google_auth_callback(
         return HttpResponse::BadRequest().finish();
     }
 
-    let mut connection = redis_connection.get_ref().clone();
+    let mut connection = match redis_client.get_multiplexed_tokio_connection().await {
+        Ok(value) => value,
+        Err(_) => {
+            error!("authentication storage unavailable");
+            return HttpResponse::ServiceUnavailable().finish();
+        }
+    };
     let transaction = match claim_external_callback(&mut connection, &query.state).await {
         Ok(value) => value,
         Err(
@@ -583,7 +592,7 @@ async fn exchange_auth_handoff(
     request: HttpRequest,
     body: web::Json<HandoffExchangeRequest>,
     postgres_pool: web::Data<PgPool>,
-    redis_connection: web::Data<redis::aio::MultiplexedConnection>,
+    redis_client: web::Data<redis::Client>,
 ) -> HttpResponse {
     let body = body.into_inner();
     if validate_fixed_reference_value(&body.code).is_err()
@@ -613,7 +622,10 @@ async fn exchange_auth_handoff(
         Ok(value) => value,
         Err(_) => return HttpResponse::BadRequest().finish(),
     };
-    let mut connection = redis_connection.get_ref().clone();
+    let mut connection = match redis_client.get_multiplexed_tokio_connection().await {
+        Ok(value) => value,
+        Err(_) => return HttpResponse::ServiceUnavailable().finish(),
+    };
     match exchange_handoff(&mut connection, &body.code, &service_id, &challenge).await {
         Ok(result) => HttpResponse::Ok().json(HandoffExchangeResponse {
             internal_user_id: result.internal_user_id,
@@ -634,7 +646,7 @@ async fn logout_get(
     request: HttpRequest,
     query: web::Query<LogoutQuery>,
     postgres_pool: web::Data<PgPool>,
-    redis_connection: web::Data<redis::aio::MultiplexedConnection>,
+    redis_client: web::Data<redis::Client>,
 ) -> HttpResponse {
     let query = query.into_inner();
     if validate_service_id(&query.service_id).is_err() {
@@ -685,7 +697,10 @@ async fn logout_get(
         expires_at,
         status: UsageStatus::Unused,
     };
-    let mut connection = redis_connection.get_ref().clone();
+    let mut connection = match redis_client.get_multiplexed_tokio_connection().await {
+        Ok(value) => value,
+        Err(_) => return HttpResponse::ServiceUnavailable().finish(),
+    };
     if write_logout(&mut connection, &logout_reference, &transaction, now)
         .await
         .is_err()
@@ -700,7 +715,7 @@ async fn logout_get(
 async fn logout_post(
     request: HttpRequest,
     form: web::Form<LogoutForm>,
-    redis_connection: web::Data<redis::aio::MultiplexedConnection>,
+    redis_client: web::Data<redis::Client>,
 ) -> HttpResponse {
     let form = form.into_inner();
     if validate_fixed_reference_value(&form.logout_reference).is_err()
@@ -715,7 +730,10 @@ async fn logout_post(
         return HttpResponse::BadRequest().finish();
     }
     let csrf_lookup = reference_value_lookup(&form.csrf_token);
-    let mut connection = redis_connection.get_ref().clone();
+    let mut connection = match redis_client.get_multiplexed_tokio_connection().await {
+        Ok(value) => value,
+        Err(_) => return HttpResponse::ServiceUnavailable().finish(),
+    };
     match complete_common_logout(
         &mut connection,
         &form.logout_reference,
@@ -780,7 +798,7 @@ async fn main() -> std::io::Result<()> {
         redis::Client::open(auth_foundation_config.redis_url.as_str()).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "failed to create Redis client")
         })?;
-    let redis_connection = redis_client
+    let redis_startup_connection = redis_client
         .get_multiplexed_tokio_connection()
         .await
         .map_err(|_| {
@@ -790,6 +808,7 @@ async fn main() -> std::io::Result<()> {
             )
         })?;
     info!("Redis connection established");
+    drop(redis_startup_connection);
 
     let google_authorization_config = GoogleAuthorizationConfig {
         client_id: auth_foundation_config.google_client_id.clone(),
@@ -828,7 +847,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(google_authorization_config.clone()))
             .app_data(google_callback_config.clone())
             .app_data(web::Data::new(postgres_pool.clone()))
-            .app_data(web::Data::new(redis_connection.clone()))
+            .app_data(web::Data::new(redis_client.clone()))
             .configure(configure_auth_routes)
     })
     .bind("0.0.0.0:8080")?
@@ -976,8 +995,8 @@ mod tests {
             .connect(&database_url)
             .await
             .expect("connect disposable PostgreSQL");
-        let redis_connection = redis::Client::open(redis_url)
-            .expect("open disposable Redis")
+        let redis_client = redis::Client::open(redis_url).expect("open disposable Redis");
+        let redis_connection = redis_client
             .get_multiplexed_tokio_connection()
             .await
             .expect("connect disposable Redis");
@@ -1055,7 +1074,7 @@ mod tests {
         let app = actix_web::test::init_service(
             App::new()
                 .app_data(web::Data::new(pool.clone()))
-                .app_data(web::Data::new(redis_connection.clone()))
+                .app_data(web::Data::new(redis_client.clone()))
                 .app_data(web::Data::new(google_config))
                 .service(web::scope("").wrap(auth_security_headers()).service(login)),
         )
@@ -1434,7 +1453,7 @@ mod tests {
         let failed_app = actix_web::test::init_service(
             App::new()
                 .app_data(web::Data::new(closed_pool))
-                .app_data(web::Data::new(redis_connection.clone()))
+                .app_data(web::Data::new(redis_client.clone()))
                 .app_data(web::Data::new(GoogleAuthorizationConfig {
                     client_id: "test-client".to_owned(),
                     redirect_uri: RedirectUrl::new(
@@ -1615,8 +1634,8 @@ mod tests {
             .connect(&database_url)
             .await
             .expect("connect disposable PostgreSQL");
-        let redis_connection = redis::Client::open(redis_url)
-            .expect("open disposable Redis")
+        let redis_client = redis::Client::open(redis_url).expect("open disposable Redis");
+        let redis_connection = redis_client
             .get_multiplexed_tokio_connection()
             .await
             .expect("connect disposable Redis");
@@ -1666,7 +1685,7 @@ mod tests {
         let app = actix_web::test::init_service(
             App::new()
                 .app_data(web::Data::new(pool.clone()))
-                .app_data(web::Data::new(redis_connection.clone()))
+                .app_data(web::Data::new(redis_client.clone()))
                 .app_data(web::Data::new(google_config))
                 .service(
                     web::scope("")
@@ -2195,7 +2214,7 @@ mod tests {
         let resolve_failure_app = actix_web::test::init_service(
             App::new()
                 .app_data(web::Data::new(resolve_failure_pool.clone()))
-                .app_data(web::Data::new(redis_connection.clone()))
+                .app_data(web::Data::new(redis_client.clone()))
                 .app_data(web::Data::new(GoogleCallbackConfig {
                     oauth_client: BasicClient::new(
                         ClientId::new("test-client".to_owned()),
@@ -2422,8 +2441,8 @@ mod tests {
             .connect(&database_url)
             .await
             .expect("connect disposable PostgreSQL");
-        let redis_connection = redis::Client::open(redis_url)
-            .expect("open disposable Redis")
+        let redis_client = redis::Client::open(redis_url).expect("open disposable Redis");
+        let redis_connection = redis_client
             .get_multiplexed_tokio_connection()
             .await
             .expect("connect disposable Redis");
@@ -2486,7 +2505,7 @@ mod tests {
         let app = actix_web::test::init_service(
             App::new()
                 .app_data(web::Data::new(pool.clone()))
-                .app_data(web::Data::new(redis_connection.clone()))
+                .app_data(web::Data::new(redis_client.clone()))
                 .service(
                     web::scope("")
                         .wrap(auth_security_headers())
@@ -3342,7 +3361,7 @@ mod tests {
         let concurrent_app_a = actix_web::test::init_service(
             App::new()
                 .app_data(web::Data::new(pool.clone()))
-                .app_data(web::Data::new(redis_connection.clone()))
+                .app_data(web::Data::new(redis_client.clone()))
                 .service(
                     web::scope("").wrap(auth_security_headers()).service(
                         web::resource("/auth/handoffs/exchange")
@@ -3355,7 +3374,7 @@ mod tests {
         let concurrent_app_b = actix_web::test::init_service(
             App::new()
                 .app_data(web::Data::new(pool.clone()))
-                .app_data(web::Data::new(redis_connection.clone()))
+                .app_data(web::Data::new(redis_client.clone()))
                 .service(
                     web::scope("").wrap(auth_security_headers()).service(
                         web::resource("/auth/handoffs/exchange")
@@ -3475,5 +3494,152 @@ mod tests {
             .execute(&pool)
             .await
             .expect("cleanup services");
+    }
+
+    #[actix_web::test]
+    #[ignore = "requires disposable PostgreSQL"]
+    async fn t26_login_redis_acquisition_failure_is_fail_closed() {
+        use sqlx::postgres::PgPoolOptions;
+
+        let database_url = std::env::var("AUTH_FOUNDATION_TEST_DATABASE_URL")
+            .expect("AUTH_FOUNDATION_TEST_DATABASE_URL must be set");
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .expect("connect disposable PostgreSQL");
+        let suffix = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time after epoch")
+            .as_nanos();
+        let service_id = format!("t26{suffix}");
+        sqlx::query(
+            "INSERT INTO public.registered_web_services (service_id, is_enabled, login_callback_uri, logout_return_uri, service_secret_sha256)
+             VALUES ($1, true, 'https://service.example.test/login', 'https://service.example.test/logout', $2)",
+        )
+        .bind(&service_id)
+        .bind(vec![0_u8; 32])
+        .execute(&pool)
+        .await
+        .expect("insert service");
+
+        let unavailable_redis_client =
+            redis::Client::open("redis://127.0.0.1:0/").expect("create unavailable Redis client");
+        let google_config = GoogleAuthorizationConfig {
+            client_id: "test-client".to_owned(),
+            redirect_uri: RedirectUrl::new(
+                "https://auth.example.test/auth/google/callback".to_owned(),
+            )
+            .expect("valid redirect URL"),
+        };
+        let app = actix_web::test::init_service(
+            App::new()
+                .app_data(web::Data::new(pool.clone()))
+                .app_data(web::Data::new(unavailable_redis_client))
+                .app_data(web::Data::new(google_config))
+                .service(web::scope("").wrap(auth_security_headers()).service(login)),
+        )
+        .await;
+        let response = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri(&format!(
+                    "/auth/login?service_id={service_id}&state=service-state&code_challenge={}&code_challenge_method=S256",
+                    "A".repeat(43)
+                ))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            actix_web::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(response.headers().get(header::LOCATION).is_none());
+
+        sqlx::query("DELETE FROM public.registered_web_services WHERE service_id = $1")
+            .bind(&service_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup service");
+    }
+
+    #[actix_web::test]
+    #[ignore = "requires disposable Redis 6.2.6"]
+    async fn t26_retained_redis_client_acquires_fresh_connection_after_old_connection_fails() {
+        use crate::redis_state::read_external;
+
+        let redis_url = std::env::var("AUTH_FOUNDATION_TEST_REDIS_URL")
+            .expect("AUTH_FOUNDATION_TEST_REDIS_URL must be set");
+        let redis_client = redis::Client::open(redis_url).expect("open disposable Redis");
+        let mut connection_one = redis_client
+            .get_multiplexed_tokio_connection()
+            .await
+            .expect("acquire connection one");
+        let connection_one_id: i64 = redis::cmd("CLIENT")
+            .arg("ID")
+            .query_async(&mut connection_one)
+            .await
+            .expect("connection one works");
+        let mut control_connection = redis_client
+            .get_multiplexed_tokio_connection()
+            .await
+            .expect("acquire control connection");
+        let _: () = redis::cmd("CLIENT")
+            .arg("KILL")
+            .arg("ID")
+            .arg(connection_one_id)
+            .query_async(&mut control_connection)
+            .await
+            .expect("kill connection one");
+        let old_connection_result: redis::RedisResult<String> =
+            redis::cmd("PING").query_async(&mut connection_one).await;
+        assert!(
+            old_connection_result.is_err(),
+            "killed connection must fail"
+        );
+
+        let mut connection_two = redis_client
+            .get_multiplexed_tokio_connection()
+            .await
+            .expect("acquire fresh connection two");
+        let now = unix_seconds(SystemTime::now()).expect("time after epoch");
+        let expires_at = now + EXTERNAL_AUTH_TRANSACTION_TTL_SECONDS;
+        let reference = generate_reference_value().expect("external reference");
+        let state = ExternalAuthTransaction {
+            service_id: "t26-recovery".to_owned(),
+            service_state: "service-state".to_owned(),
+            handoff_code_challenge: "A".repeat(43),
+            provider: "google".to_owned(),
+            provider_verification_data: String::new(),
+            created_at: now,
+            expires_at,
+            status: ExternalStatus::Waiting,
+        };
+        write_external(&mut connection_two, &reference, &state, now)
+            .await
+            .expect("fresh connection state write");
+        assert_eq!(
+            read_external(&mut connection_two, &reference, now)
+                .await
+                .expect("read freshly written state"),
+            state
+        );
+        let redis_time: Vec<String> = redis::cmd("TIME")
+            .query_async(&mut connection_two)
+            .await
+            .expect("read Redis time");
+        let redis_now: i64 = redis_time[0].parse().expect("Redis seconds");
+        let redis_ttl: i64 = redis::cmd("TTL")
+            .arg(crate::redis_state::external_key(&reference))
+            .query_async(&mut connection_two)
+            .await
+            .expect("read Redis TTL");
+        let expected_ttl = expires_at as i64 - redis_now;
+        assert!(redis_ttl <= expected_ttl && redis_ttl >= expected_ttl - 1);
+        let _: () = redis::cmd("DEL")
+            .arg(crate::redis_state::external_key(&reference))
+            .query_async(&mut connection_two)
+            .await
+            .expect("cleanup recovery state");
     }
 }
