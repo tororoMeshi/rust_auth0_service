@@ -18,7 +18,7 @@ spec:
         app: portal-backend
     spec:
       containers:
-        - image: tororomeshi/portal-backend:latest
+        - image: docker.io/tororomeshi/portal-backend@sha256:bae955bbaed09feaff928b522732a9a502ceed51da7dc58640a37419edc67d0f
           name: portal-backend
           imagePullPolicy: Always
           env:
