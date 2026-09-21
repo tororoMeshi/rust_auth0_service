@@ -872,6 +872,18 @@ Gate Eを通過している。
 
 - 新構成だけが稼働し、旧認証状態と旧経路が利用不能である。
 
+**T26 closeout（2026-09-21）**
+
+- **T26 = CLOSED / COMPLETE**。production cutover = COMPLETE、final production smoke = PASS。
+- 最終受入系列は `0/0 → 1/1 → 1/1`。初回Google loginはinternal user/external identityを各1件だけ作成し、Portal LocalSessionと`/api/me`がPASS。同じGoogle accountをfresh browser contextから再loginすると既存internal userを再利用し、重複external identityを作らず、LocalSessionと`/api/me`がPASSした。
+- `portal-prod.is_enabled=true`。`rust-auth0-service`、`portal-backend`、`frontend` はReady、`rust-auth0-service` restart countは0。bounded smoke windowでRedis/PostgreSQL/handoff errorはなく、rollbackは発生していない。
+- source/deployment HEAD: `4a5b0c93bf4addf14346da8a7203c29aa91bbee2`。
+- live Auth Foundation image: `docker.io/tororomeshi/rust_auth0_service@sha256:1bceed2c650faa1ba93651c0ffa4599a66a9c5f5d452bc61a97db05420ca1737`。
+- new Auth Foundationがauthoritative。legacy user/numeric ID/external identity migration、legacy JWT compatibility、old runtime rollback、database rollbackは意図的に行わず、legacy `public.users`は未使用のまま残置する。Google-only external identity adapter、applications-owned local session、Auth Foundation-owned common SSO sessionを使用し、parent-domain shared JWT cookieは持たず、browser returnはcode/stateのみ、appsへは`internal_user_id`だけを渡す。
+- Redis correction: startup-created connectionをprocess lifetimeで再利用せず、`redis::Client`を保持してRedis使用HTTP requestごとにfresh `MultiplexedConnection`を取得し、同一request内のcommandは同一connectionを使う。失敗requestはfail closed・同一request retryなし、後続requestはprocess restartなしで再接続する。persistent-recovery defectは証明・修正済みだが、最初のtransport `IoError`の原因自体は未確定である。
+- exact-image proofでは、Redis unavailable時にrequestが503となってもAuth Foundationは稼働し、Redis復旧後は同一processの後続requestでfresh connectionを取得して`HSET` + `EXPIREAT`に成功し、Google redirectへ進んだ。本番でもfresh `/login`からGoogle authorization到達を確認した。
+- PostgreSQLは`PGSSLMODE=require`でtransport TLSを必須化し、`pg_stat_ssl.ssl=true`を確認済み。現在は暗号化のみで、server certificate identity verification（`verify-full`）は未有効化である。
+
 ## 5. 統合検証
 
 検証はT22の単体、T23のPostgreSQL統合・Redis統合、T24のHTTP統合・ブラウザフロー、T25のKubernetes配置・一括移行リハーサルに分ける。正常ログイン、SSO、LoginStart不一致、別ブラウザ、PKCE不一致、無効サービス、無効ユーザー、handoff期限切れ・再利用・同時交換、callback二重処理、Redis障害、PostgreSQL障害、portal_backend再起動、handoff交換レスポンス喪失、ローカルログアウト、共通ログアウト、旧JWT・旧Cookie・旧API・uniauthの拒否を、該当タスクの最小代表ケースとして確認する。
@@ -892,3 +904,11 @@ T05 の通常 schema migration で新3テーブルを作成する。T21 は同�
 - portal_backendが1 replica・Recreateであり、再起動でローカル状態が失効する。
 - 旧API、旧usersテーブル、旧ログイン状態が存在せず、既存internal_user_idが維持される。
 - 互換コード、二重書込み、fallback、feature flagが存在しない。
+
+## 8. Post-cutover follow-ups
+
+T26の完了条件とは独立した作業であり、T26をopenに戻す理由ではない。
+
+- **PostgreSQL certificate / verify-full（post-cutover security hardening）**: expired/self-signed/no-SAN certificate setupを置き換え、適切なtrust chain/SANを整え、暗号化のみの`Require`からserver-identity verification（例: `verify-full`）へ移行する。
+- **Rust/toolchain/dependency modernization（post-cutover maintenance）**: production cutoverが安定した後にRust toolchainとdependenciesを見直し・更新する。完了済みのcutover correctionとは混在させない。
+- **Frontend ConfigMap rollout behavior（post-cutover operational reliability）**: `nginx.conf`のsubPath mountでは既存Podが更新後もstale contentを保持するため、関連ConfigMap変更に対するdeterministic automatic rollout（pod-template checksum等の最小機構）を設計する。
